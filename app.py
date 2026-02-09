@@ -21,7 +21,7 @@ TARGET_ETFS = ['TLT', 'TBT', 'VNQ', 'GLD', 'SLV']
 YAHOO_MACRO = ['^VIX', '^TNX', 'DX-Y.NYB']
 FRED_API_KEY = st.secrets.get("FRED_API_KEY")
 
-# --- 2. DATA ENGINE (With Rate Limit Protection) ---
+# --- 2. DATA ENGINE ---
 def get_next_market_date():
     tz = pytz.timezone('US/Eastern')
     now = datetime.now(tz)
@@ -45,7 +45,6 @@ def get_master_data(api_key):
     all_tickers = TARGET_ETFS + YAHOO_MACRO
     combined = pd.DataFrame()
     
-    # Attempt download with backoff for rate limits
     for attempt in range(3):
         try:
             raw = yf.download(all_tickers, start="2010-01-01", auto_adjust=True, progress=False)
@@ -53,11 +52,8 @@ def get_master_data(api_key):
             if not prices.empty:
                 combined = prices
                 break
-        except Exception as e:
-            if attempt < 2:
-                time.sleep(5 * (attempt + 1))
-                continue
-            st.error(f"Yahoo Finance Error: {e}")
+        except Exception:
+            time.sleep(5 * (attempt + 1))
             
     fred_df = fetch_fred_yield(api_key)
     if not combined.empty:
@@ -84,7 +80,7 @@ class TradingEnv(gym.Env):
         return obs, {}
 
     def step(self, action):
-        reward = self.df[self.etfs[action]].iloc[self.current_step]
+        reward = float(self.df[self.etfs[action]].iloc[self.current_step])
         self.current_step += 1
         done = self.current_step >= len(self.df) - 1
         obs = self.df[self.feature_cols].iloc[self.current_step].values.astype(np.float32)
@@ -167,9 +163,10 @@ def run_tournament(data):
     results['PPO'] = [y_live[i, a] for i, a in enumerate(ppo_actions)]
     results['A2C'] = [y_live[i, a] for i, a in enumerate(a2c_actions)]
 
-    # DL TRAINING
-    X_t, y_t = torch.tensor(X_train_sc), torch.tensor(y_train)
-    X_l_t = torch.tensor(X_live_sc)
+    # DL TRAINING - FIXED DTYPES
+    X_t = torch.tensor(X_train_sc).float()
+    y_t = torch.tensor(y_train).float()
+    X_l_t = torch.tensor(X_live_sc).float()
 
     for name, m_class in [("CNN-LSTM", CNN_LSTM_Model), ("Transformer", TransformerModel)]:
         model = m_class(len(feature_cols), len(TARGET_ETFS))
@@ -214,4 +211,4 @@ else:
         for i, (name, rets) in enumerate(tournament_res.items()):
             cols[i].metric(name, "BUY SIGNAL", delta="Active")
     else:
-        st.warning("Could not fetch market data. Yahoo Finance may be rate-limiting. Please wait 5-10 minutes.")
+        st.warning("Market data unavailable. Please check API keys or Yahoo Finance limits.")

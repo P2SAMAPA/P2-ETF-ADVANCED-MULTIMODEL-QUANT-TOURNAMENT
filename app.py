@@ -52,16 +52,23 @@ def get_master_data(api_key):
 class TradingEnv(gym.Env):
     def __init__(self, df, etfs):
         super().__init__()
-        self.df = df
+        self.df = df.reset_index(drop=True)
         self.etfs = etfs
         self.action_space = gym.spaces.Discrete(len(etfs))
-        self.observation_space = gym.spaces.Box(low=-10, high=10, shape=(df.shape[1],), dtype=np.float32)
+        # Match observation space exactly to the number of columns in df
+        self.observation_space = gym.spaces.Box(
+            low=-np.inf, 
+            high=np.inf, 
+            shape=(df.shape[1],), 
+            dtype=np.float32
+        )
         self.current_step = 0
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         self.current_step = 0
-        return self.df.iloc[0].values.astype(np.float32), {}
+        obs = self.df.iloc[self.current_step].values.astype(np.float32)
+        return obs, {}
 
     def step(self, action):
         reward = self.df[self.etfs[action]].iloc[self.current_step]
@@ -113,7 +120,6 @@ def run_tournament(data):
     X_train, X_live = X_s[:split], X_s[split:]
     y_train, y_live = y_s[:split], y_s[split:]
 
-    # Scaling with Robustness
     scaler = StandardScaler()
     X_train_flat = X_train.reshape(-1, X_train.shape[-1])
     scaler.fit(X_train_flat)
@@ -129,18 +135,28 @@ def run_tournament(data):
     results = {}
     
     # RL MODELS (PPO & A2C)
-    rl_train_df = pd.DataFrame(X_train_sc[:, -1, :]).join(pd.DataFrame(y_train, columns=TARGET_ETFS))
-    env = DummyVecEnv([lambda: TradingEnv(rl_train_df, TARGET_ETFS)])
+    # The train_df must contain the same columns as the observation space expects
+    train_obs = X_train_sc[:, -1, :]
+    train_df = pd.DataFrame(train_obs, columns=X.columns)
+    # We add labels just so the Environment can calculate 'reward' during training
+    train_env_df = train_df.copy()
+    for col in TARGET_ETFS:
+        train_env_df[col] = y_train[:, TARGET_ETFS.index(col)]
+
+    def make_env():
+        return TradingEnv(train_env_df, TARGET_ETFS)
+
+    env = DummyVecEnv([make_env])
     
-    ppo = PPO("MlpPolicy", env, verbose=0).learn(total_timesteps=1500)
-    a2c = A2C("MlpPolicy", env, verbose=0).learn(total_timesteps=1500)
+    ppo = PPO("MlpPolicy", env, verbose=0).learn(total_timesteps=2000)
+    a2c = A2C("MlpPolicy", env, verbose=0).learn(total_timesteps=2000)
     
     ppo_actions, a2c_actions = [], []
+    # Predict on the live data
     for obs in X_live_sc[:, -1, :]:
-        # Critical Fix: Batch observation as float32
-        obs_input = np.array([obs], dtype=np.float32)
-        p_act, _ = ppo.predict(obs_input, deterministic=True)
-        a_act, _ = a2c.predict(obs_input, deterministic=True)
+        # Wrap observation in a list to satisfy DummyVecEnv shape [1, n_features]
+        p_act, _ = ppo.predict(np.array([obs]), deterministic=True)
+        a_act, _ = a2c.predict(np.array([obs]), deterministic=True)
         ppo_actions.append(p_act[0])
         a2c_actions.append(a_act[0])
     
@@ -155,7 +171,7 @@ def run_tournament(data):
     for name, m_class in [("CNN-LSTM", CNN_LSTM_Model), ("Transformer", TransformerModel)]:
         model = m_class(X_t.shape[2], len(TARGET_ETFS))
         opt = torch.optim.Adam(model.parameters(), lr=0.005)
-        for _ in range(25):
+        for _ in range(30):
             opt.zero_grad()
             loss = nn.MSELoss()(model(X_t), y_t)
             loss.backward()
@@ -176,8 +192,7 @@ if not FRED_API_KEY:
 else:
     df_raw = get_master_data(FRED_API_KEY)
     if not df_raw.empty:
-        with st.status("Initializing Tournament Architectures...", expanded=True) as status:
-            st.write("Fetching Market Regimes...")
+        with st.status("Running Model Tournament...", expanded=True) as status:
             tournament_res, dates = run_tournament(df_raw)
             status.update(label="Tournament Complete!", state="complete", expanded=False)
         

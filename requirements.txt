@@ -1,0 +1,13 @@
+# requirements.txt
+streamlit
+yfinance
+pandas
+numpy
+torch
+stable-baselines3
+shimmy
+gymnasium
+scikit-learn
+pytz
+requests
+plotly

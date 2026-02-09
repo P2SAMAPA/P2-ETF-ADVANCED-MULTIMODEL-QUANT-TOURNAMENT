@@ -12,6 +12,7 @@ import gymnasium as gym
 from sklearn.preprocessing import StandardScaler
 from datetime import datetime, timedelta
 import pytz
+import time
 
 # --- 1. CONFIGURATION ---
 st.set_page_config(page_title="Advanced Alpha Tournament", layout="wide")
@@ -20,7 +21,7 @@ TARGET_ETFS = ['TLT', 'TBT', 'VNQ', 'GLD', 'SLV']
 YAHOO_MACRO = ['^VIX', '^TNX', 'DX-Y.NYB']
 FRED_API_KEY = st.secrets.get("FRED_API_KEY")
 
-# --- 2. DATA ENGINE ---
+# --- 2. DATA ENGINE (With Rate Limit Protection) ---
 def get_next_market_date():
     tz = pytz.timezone('US/Eastern')
     now = datetime.now(tz)
@@ -32,7 +33,7 @@ def get_next_market_date():
 def fetch_fred_yield(api_key):
     url = f"https://api.stlouisfed.org/fred/series/observations?series_id=T10Y2Y&api_key={api_key}&file_type=json"
     try:
-        r = requests.get(url, timeout=10).json()
+        r = requests.get(url, timeout=15).json()
         df = pd.DataFrame(r['observations'])
         df['date'] = pd.to_datetime(df['date'])
         df['value'] = pd.to_numeric(df['value'], errors='coerce')
@@ -42,10 +43,25 @@ def fetch_fred_yield(api_key):
 @st.cache_data(ttl=3600)
 def get_master_data(api_key):
     all_tickers = TARGET_ETFS + YAHOO_MACRO
-    raw = yf.download(all_tickers, start="2010-01-01", auto_adjust=True)
-    prices = raw['Close'] if isinstance(raw.columns, pd.MultiIndex) else raw
+    combined = pd.DataFrame()
+    
+    # Attempt download with backoff for rate limits
+    for attempt in range(3):
+        try:
+            raw = yf.download(all_tickers, start="2010-01-01", auto_adjust=True, progress=False)
+            prices = raw['Close'] if isinstance(raw.columns, pd.MultiIndex) else raw
+            if not prices.empty:
+                combined = prices
+                break
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(5 * (attempt + 1))
+                continue
+            st.error(f"Yahoo Finance Error: {e}")
+            
     fred_df = fetch_fred_yield(api_key)
-    combined = pd.concat([prices, fred_df], axis=1).ffill().dropna()
+    if not combined.empty:
+        combined = pd.concat([combined, fred_df], axis=1).ffill().dropna()
     return combined
 
 # --- 3. REINFORCEMENT LEARNING ENV ---
@@ -56,12 +72,8 @@ class TradingEnv(gym.Env):
         self.etfs = etfs
         self.feature_cols = feature_cols
         self.action_space = gym.spaces.Discrete(len(etfs))
-        # Hard-coded fix for observation shape to ensure it always matches input features
         self.observation_space = gym.spaces.Box(
-            low=-np.inf, 
-            high=np.inf, 
-            shape=(len(feature_cols),), 
-            dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(len(feature_cols),), dtype=np.float32
         )
         self.current_step = 0
 
@@ -111,9 +123,7 @@ def run_tournament(data):
     idx = rets.index.intersection(features.index)
     X, y = features.loc[idx], rets.loc[idx]
     
-    # Store explicit feature column names
     feature_cols = X.columns.tolist()
-    
     seq_len = 10
     X_s, y_s = [], []
     for i in range(len(X) - seq_len):
@@ -126,34 +136,27 @@ def run_tournament(data):
     y_train, y_live = y_s[:split], y_s[split:]
 
     scaler = StandardScaler()
-    X_train_flat = X_train.reshape(-1, X_train.shape[-1])
-    scaler.fit(X_train_flat)
+    scaler.fit(X_train.reshape(-1, X_train.shape[-1]))
     
     def scale_seq(seq_data):
         flat = seq_data.reshape(-1, seq_data.shape[-1])
-        scaled = scaler.transform(flat).reshape(seq_data.shape)
-        return np.nan_to_num(scaled).astype(np.float32)
+        return scaler.transform(flat).reshape(seq_data.shape).astype(np.float32)
 
-    X_train_sc = scale_seq(X_train)
-    X_live_sc = scale_seq(X_live)
-
+    X_train_sc, X_live_sc = scale_seq(X_train), scale_seq(X_live)
     results = {}
     
-    # RL MODELS (Fixing prediction shape mismatch)
+    # RL TRAINING
     train_obs = X_train_sc[:, -1, :]
     train_env_df = pd.DataFrame(train_obs, columns=feature_cols)
     for i, col in enumerate(TARGET_ETFS):
         train_env_df[col] = y_train[:, i]
 
-    def make_env():
-        return TradingEnv(train_env_df, TARGET_ETFS, feature_cols)
-
+    def make_env(): return TradingEnv(train_env_df, TARGET_ETFS, feature_cols)
     env = DummyVecEnv([make_env])
     
     ppo = PPO("MlpPolicy", env, verbose=0).learn(total_timesteps=1500)
     a2c = A2C("MlpPolicy", env, verbose=0).learn(total_timesteps=1500)
     
-    # Corrected prediction loop: passing individual 1D observations
     ppo_actions, a2c_actions = [], []
     for obs in X_live_sc[:, -1, :]:
         p_act, _ = ppo.predict(np.array([obs]), deterministic=True)
@@ -164,18 +167,16 @@ def run_tournament(data):
     results['PPO'] = [y_live[i, a] for i, a in enumerate(ppo_actions)]
     results['A2C'] = [y_live[i, a] for i, a in enumerate(a2c_actions)]
 
-    # SEQUENCE MODELS
-    X_t = torch.tensor(X_train_sc, dtype=torch.float32)
-    y_t = torch.tensor(y_train, dtype=torch.float32)
-    X_l_t = torch.tensor(X_live_sc, dtype=torch.float32)
+    # DL TRAINING
+    X_t, y_t = torch.tensor(X_train_sc), torch.tensor(y_train)
+    X_l_t = torch.tensor(X_live_sc)
 
     for name, m_class in [("CNN-LSTM", CNN_LSTM_Model), ("Transformer", TransformerModel)]:
         model = m_class(len(feature_cols), len(TARGET_ETFS))
         opt = torch.optim.Adam(model.parameters(), lr=0.005)
         for _ in range(25):
             opt.zero_grad()
-            loss = nn.MSELoss()(model(X_t), y_t)
-            loss.backward()
+            nn.MSELoss()(model(X_t), y_t).backward()
             opt.step()
         
         with torch.no_grad():
@@ -186,7 +187,6 @@ def run_tournament(data):
 
 # --- 6. UI ---
 st.title("🏆 Advanced Quant Alpha Tournament")
-st.markdown("Comparing **PPO, A2C, CNN-LSTM, and Transformer** on identical macro regimes.")
 
 if not FRED_API_KEY:
     st.error("Please add FRED_API_KEY to your Streamlit Secrets.")
@@ -206,11 +206,12 @@ else:
             fig.add_trace(go.Scatter(x=dates, y=np.cumprod(1 + np.array(rets)), name=name))
         
         st.table(pd.DataFrame(summary).sort_values("Cumulative Return", ascending=False))
-        fig.update_layout(title="Equity Curve Comparison", template="plotly_dark", height=450)
         st.plotly_chart(fig, use_container_width=True)
 
         target_date = get_next_market_date()
-        st.subheader(f"🎯 Forecasts for US Open: {target_date}")
+        st.subheader(f"🎯 Predictions for: {target_date}")
         cols = st.columns(len(tournament_res))
         for i, (name, rets) in enumerate(tournament_res.items()):
             cols[i].metric(name, "BUY SIGNAL", delta="Active")
+    else:
+        st.warning("Could not fetch market data. Yahoo Finance may be rate-limiting. Please wait 5-10 minutes.")

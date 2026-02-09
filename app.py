@@ -15,29 +15,37 @@ import requests
 # --- 1. SETTINGS & STATE ---
 st.set_page_config(page_title="Quant Alpha Tournament", layout="wide")
 
-# Persistent state for results
 if 'results' not in st.session_state: st.session_state.results = None
 
 TARGET_ETFS = ['TLT', 'TBT', 'VNQ', 'GLD', 'SLV']
 MACRO = ['^VIX', '^TNX', 'DX-Y.NYB']
 FRED_API_KEY = st.secrets.get("FRED_API_KEY")
 
-# --- 2. ANALYTICS & DATA UTILITIES ---
-def get_sofr_rate(api_key):
-    """Fetches latest SOFR from FRED. Falls back to 3.6% if API fails."""
-    if not api_key: return 0.036 
-    url = f"https://api.stlouisfed.org/fred/series/observations?series_id=SOFR&api_key={api_key}&file_type=json"
-    try:
-        r = requests.get(url, timeout=10).json()
-        return float(r['observations'][-1]['value']) / 100
-    except: return 0.036
+# --- 2. DEEP LEARNING ARCHITECTURES ---
+class CNN_LSTM_Model(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super().__init__()
+        self.cnn = nn.Conv1d(input_dim, 64, kernel_size=3, padding=1)
+        self.lstm = nn.LSTM(64, 128, batch_first=True)
+        self.fc = nn.Linear(128, output_dim)
+    def forward(self, x):
+        # x: [batch, 1, features] -> transpose for CNN
+        x = x.transpose(1, 2)
+        x = torch.relu(self.cnn(x)).transpose(1, 2)
+        _, (hn, _) = self.lstm(x)
+        return self.fc(hn[-1])
 
-def calculate_sharpe(returns, rf_rate):
-    returns = np.array(returns)
-    daily_rf = rf_rate / 252
-    excess = returns - daily_rf
-    if np.std(excess) == 0: return 0
-    return (np.mean(excess) / np.std(excess)) * np.sqrt(252)
+class TransformerModel(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super().__init__()
+        self.input_proj = nn.Linear(input_dim, 64)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=64, nhead=4, batch_first=True)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
+        self.fc = nn.Linear(64, output_dim)
+    def forward(self, x):
+        x = self.input_proj(x)
+        x = self.transformer(x)
+        return self.fc(x[:, -1, :])
 
 # --- 3. RL ENVIRONMENT ---
 class TradingEnv(gym.Env):
@@ -45,7 +53,7 @@ class TradingEnv(gym.Env):
         super().__init__()
         self.features, self.returns, self.etfs = features, returns, etfs
         self.action_space = gym.spaces.Discrete(len(etfs))
-        self.observation_space = gym.spaces.Box(low=-10, high=10, shape=(features.shape[1],), dtype=np.float32)
+        self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(features.shape[1],), dtype=np.float32)
         self.current_step = 0
     def reset(self, seed=None):
         self.current_step = 0
@@ -54,116 +62,110 @@ class TradingEnv(gym.Env):
         reward = float(self.returns[self.current_step, action])
         self.current_step += 1
         done = self.current_step >= len(self.features) - 1
-        obs = self.features[self.current_step] if not done else self.features[-1]
-        return obs, reward, done, False, {}
+        return self.features[self.current_step], reward, done, False, {}
 
-# --- 4. ENGINE (With 7-Day Retraining Cache) ---
-@st.cache_resource(ttl=604800) # 7 Days in seconds
-def train_and_backtest(data_json, rf_rate):
+# --- 4. ENGINE ---
+@st.cache_resource(ttl=604800) # Auto-retrain every 7 days
+def run_tournament_engine(data_json, rf_rate):
     data = pd.read_json(data_json)
     rets_df = data[TARGET_ETFS].pct_change().dropna()
     feats_df = data.shift(1).dropna()
     common_idx = rets_df.index.intersection(feats_df.index)
-    
     X, y = feats_df.loc[common_idx].values, rets_df.loc[common_idx].values
+    
     scaler = StandardScaler()
     X_sc = scaler.fit_transform(X).astype(np.float32)
     split = int(len(X_sc) * 0.8)
-    
-    # Train Models
-    env = DummyVecEnv([lambda: TradingEnv(X_sc[:split], y[:split], TARGET_ETFS)])
-    ppo_model = PPO("MlpPolicy", env, verbose=0).learn(total_timesteps=2000)
-    a2c_model = A2C("MlpPolicy", env, verbose=0).learn(total_timesteps=2000)
-    
-    # Out-of-Sample Evaluation
-    results = {"PPO": [], "A2C": [], "Equal-Weight": []}
+    X_train, X_test = X_sc[:split], X_sc[split:]
+    y_train, y_test = y[:split], y[split:]
+
+    # A. RL MODELS
+    env = DummyVecEnv([lambda: TradingEnv(X_train, y_train, TARGET_ETFS)])
+    ppo = PPO("MlpPolicy", env, verbose=0).learn(1500)
+    a2c = A2C("MlpPolicy", env, verbose=0).learn(1500)
+
+    # B. DL MODELS
+    dl_results = {}
+    for name, m_class in [("CNN-LSTM", CNN_LSTM_Model), ("Transformer", TransformerModel)]:
+        model = m_class(X.shape[1], len(TARGET_ETFS))
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
+        X_t = torch.tensor(X_train).unsqueeze(1)
+        y_t = torch.tensor(y_train).float()
+        for _ in range(30):
+            optimizer.zero_grad()
+            nn.MSELoss()(model(X_t), y_t).backward()
+            optimizer.step()
+        dl_results[name] = model
+
+    # BACKTEST & SELECTION
+    results = {"PPO": [], "A2C": [], "CNN-LSTM": [], "Transformer": []}
     dates = common_idx[split:]
-    X_test, y_test = X_sc[split:], y[split:]
     
     for i in range(len(X_test)):
-        p_act, _ = ppo_model.predict(X_test[i], deterministic=True)
-        a_act, _ = a2c_model.predict(X_test[i], deterministic=True)
+        # RL Preds
+        p_act, _ = ppo.predict(X_test[i], deterministic=True)
+        a_act, _ = a2c.predict(X_test[i], deterministic=True)
         results["PPO"].append(y_test[i, p_act])
         results["A2C"].append(y_test[i, a_act])
-        results["Equal-Weight"].append(np.mean(y_test[i]))
-
-    # Identify Champion based on Cumulative Return
-    perf = {k: np.prod(1 + np.array(v)) for k, v in results.items()}
-    champion_name = max(perf, key=perf.get)
-    
-    # Forecast with Champion
-    latest_feat = X_sc[-1]
-    if champion_name == "PPO":
-        f_act, _ = ppo_model.predict(latest_feat, deterministic=True)
-    elif champion_name == "A2C":
-        f_act, _ = a2c_model.predict(latest_feat, deterministic=True)
-    else: # Equal Weight fallback
-        f_act = np.argmax(latest_feat[:len(TARGET_ETFS)]) 
-
-    # Audit for last 15 sessions
-    audit_data = []
-    for j in range(max(0, len(X_test)-15), len(X_test)):
-        # Dynamic audit based on current champion
-        if champion_name == "A2C": act, _ = a2c_model.predict(X_test[j], deterministic=True)
-        else: act, _ = ppo_model.predict(X_test[j], deterministic=True)
         
-        audit_data.append({
-            'Date': dates[j].strftime('%Y-%m-%d'),
-            'Ticker': TARGET_ETFS[act],
-            'Daily Return': results[champion_name][j]
-        })
+        # DL Preds
+        with torch.no_grad():
+            x_input = torch.tensor(X_test[i]).reshape(1, 1, -1)
+            for name in ["CNN-LSTM", "Transformer"]:
+                out = dl_results[name](x_input)
+                results[name].append(y_test[i, torch.argmax(out).item()])
 
-    return results, dates, TARGET_ETFS[f_act], champion_name, pd.DataFrame(audit_data)
+    # CALCULATE BEST MODEL
+    perf = {k: np.prod(1 + np.array(v)) for k, v in results.items()}
+    champ_name = max(perf, key=perf.get)
+    
+    # FINAL FORECAST WITH CHAMPION
+    latest_feat = X_sc[-1:]
+    if champ_name == "PPO": final_act, _ = ppo.predict(latest_feat[0], deterministic=True)
+    elif champ_name == "A2C": final_act, _ = a2c.predict(latest_feat[0], deterministic=True)
+    else: 
+        with torch.no_grad():
+            f_out = dl_results[champ_name](torch.tensor(latest_feat).reshape(1, 1, -1))
+            final_act = torch.argmax(f_out).item()
+
+    # 15-Day Audit for Champion
+    audit_data = []
+    for j in range(len(X_test)-15, len(X_test)):
+        audit_data.append({'Date': dates[j].strftime('%Y-%m-%d'), 'Return': results[champ_name][j]})
+
+    return results, dates, TARGET_ETFS[final_act], champ_name, pd.DataFrame(audit_data)
 
 # --- 5. UI ---
-st.title("🏆 Quant Alpha Tournament")
+st.sidebar.title("Configuration")
+rf_val = st.sidebar.number_input("Risk Free Rate (SOFR %)", value=3.64) / 100
 
-# Market session logic
 now = datetime.now()
 target_date = now if now.hour < 16 else now + timedelta(days=1)
 while target_date.weekday() >= 5: target_date += timedelta(days=1)
 
-if st.button("🚀 Run Tournament"):
-    with st.status("Fetching Data & Training Models...") as status:
-        rf = get_sofr_rate(FRED_API_KEY)
+if st.button("🚀 Execute Alpha Tournament"):
+    with st.status("Training 4 Standalone Models...") as status:
         raw_data = yf.download(TARGET_ETFS + MACRO, start="2019-01-01", progress=False)['Close'].ffill().dropna()
-        
-        # We pass data as JSON to satisfy the streamlit cache requirements
-        res, dates, ticker, champ, audit = train_and_backtest(raw_data.to_json(), rf)
-        
-        st.session_state.results = {
-            "res": res, "dates": dates, "rf": rf, 
-            "ticker": ticker, "champ": champ, "audit": audit
-        }
-        status.update(label=f"Tournament Complete! Champion: {champ}", state="complete")
+        res, dates, ticker, champ, audit = run_tournament_engine(raw_data.to_json(), rf_val)
+        st.session_state.results = {"res": res, "dates": dates, "ticker": ticker, "champ": champ, "audit": audit, "rf": rf_val}
+        status.update(label=f"Champion Found: {champ}", state="complete")
 
 if st.session_state.results:
     s = st.session_state.results
-    
     st.header(f"🎯 Forecast for {target_date.strftime('%b %d')}: BUY {s['ticker']}")
-    st.subheader(f"Current Model Champion: :green[{s['champ']}]")
-    
-    # Metrics
+    st.info(f"The champion model **{s['champ']}** outperformed all others in the backtest and is generating this signal.")
+
     m1, m2, m3 = st.columns(3)
     champ_rets = np.array(s['res'][s['champ']])
-    ann_ret = (np.prod(1 + champ_rets)**(252/len(champ_rets)) - 1)
-    
-    m1.metric(f"{s['champ']} Annualized", f"{ann_ret:.2%}")
-    m2.metric(f"{s['champ']} Sharpe", f"{calculate_sharpe(champ_rets, s['rf']):.2f}")
-    m3.metric("SOFR Rate", f"{s['rf']:.2%}")
+    m1.metric("Champion Performance", f"{(np.prod(1+champ_rets)-1):.2%}", delta=s['champ'])
+    m2.metric("Champion Sharpe", f"{((np.mean(champ_rets)-(s['rf']/252))/np.std(champ_rets)*np.sqrt(252)):.2f}")
+    m3.metric("Models Competing", "4 (RL & DL)")
 
-    # Chart
     fig = go.Figure()
     for name, r in s['res'].items():
         fig.add_trace(go.Scatter(x=s['dates'], y=np.cumprod(1 + np.array(r)), name=name))
-    fig.update_layout(
-        title="Out of Sample Cumulative Return", 
-        template="plotly_dark",
-        xaxis_title="Date",
-        yaxis_title="Growth of $1"
-    )
+    fig.update_layout(title="Out of Sample Cumulative Return", template="plotly_dark", xaxis_title="Date", yaxis_title="Portfolio Growth")
     st.plotly_chart(fig, use_container_width=True)
 
-    # Audit
     st.subheader(f"📅 Last 15 Sessions Audit ({s['champ']})")
-    st.table(s['audit'].sort_values('Date', ascending=False).style.format({'Daily Return': '{:.2%}'}))
+    st.table(s['audit'].sort_values('Date', ascending=False).style.format({'Return': '{:.2%}'}))

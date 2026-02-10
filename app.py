@@ -21,7 +21,7 @@ TARGET_ETFS = ['TLT', 'TBT', 'VNQ', 'GLD', 'SLV']
 MACRO = ['^VIX', '^TNX', 'DX-Y.NYB']
 FRED_API_KEY = st.secrets.get("FRED_API_KEY")
 
-# --- 2. DEEP LEARNING ARCHITECTURES ---
+# --- 2. MODEL ARCHITECTURES ---
 class CNN_LSTM_Model(nn.Module):
     def __init__(self, input_dim, output_dim):
         super().__init__()
@@ -71,7 +71,7 @@ class TradingEnv(gym.Env):
         done = self.current_step >= len(self.features) - 1
         return self.features[self.current_step], reward, done, False, {}
 
-# --- 4. ENGINE (Retraining TTL: 7 Days) ---
+# --- 4. ENGINE ---
 @st.cache_resource(ttl=604800)
 def run_tournament_engine(data_json, rf_rate):
     data = pd.read_json(data_json)
@@ -85,7 +85,7 @@ def run_tournament_engine(data_json, rf_rate):
     split = int(len(X_sc) * 0.8) 
     X_train, X_test, y_train, y_test = X_sc[:split], X_sc[split:], y[:split], y[split:]
 
-    # A. Training
+    # Training
     env = DummyVecEnv([lambda: TradingEnv(X_train, y_train, TARGET_ETFS)])
     ppo = PPO("MlpPolicy", env, verbose=0).learn(2000)
     a2c = A2C("MlpPolicy", env, verbose=0).learn(2000)
@@ -101,7 +101,7 @@ def run_tournament_engine(data_json, rf_rate):
             opt.step()
         dl_models[name] = model
 
-    # B. Out-of-Sample Competition
+    # OOS Competition
     results = {"PPO": [], "A2C": [], "CNN-LSTM": [], "Transformer": []}
     picks = {"PPO": [], "A2C": [], "CNN-LSTM": [], "Transformer": []}
     dates = common_idx[split:]
@@ -123,7 +123,13 @@ def run_tournament_engine(data_json, rf_rate):
     perf = {k: np.prod(1 + np.array(v)) for k, v in results.items()}
     champ = max(perf, key=perf.get)
     
-    # Next Day Forecast
+    # Monthly Return Calculation for Heatmap
+    champ_rets = pd.Series(results[champ], index=dates)
+    monthly_rets = champ_rets.groupby([champ_rets.index.year, champ_rets.index.month]).apply(lambda x: (np.prod(1+x)-1))
+    monthly_table = monthly_rets.unstack().fillna(0)
+    monthly_table.columns = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][:len(monthly_table.columns)]
+
+    # Forecast
     latest_feat = X_sc[-1:]
     if champ == "PPO": f_act, _ = ppo.predict(latest_feat[0], deterministic=True)
     elif champ == "A2C": f_act, _ = a2c.predict(latest_feat[0], deterministic=True)
@@ -140,80 +146,73 @@ def run_tournament_engine(data_json, rf_rate):
             'Outcome Return': results[champ][j]
         })
 
-    return results, dates, TARGET_ETFS[f_act], champ, pd.DataFrame(audit_list)
+    return results, dates, TARGET_ETFS[f_act], champ, pd.DataFrame(audit_list), monthly_table
 
 # --- 5. UI ---
-st.title("Multi-model (DL & ML) Tournament for Prediction of ETF Returns")
+st.title("Multi-model (DL & ML) Tournament for ETF Returns")
 
 with st.sidebar:
     st.header("Tournament Configuration")
-    start_year = st.selectbox(
-        "Select Training Start Year",
-        options=["2007", "2010", "2015", "2019", "2021"],
-        index=0
-    )
-    if start_year == "2007":
-        st.warning("⚠️ Training from 2007 involves ~18 years of data. Computation may take 2-4 minutes.")
-    
+    start_year = st.selectbox("Select Training Start Year", options=["2007", "2010", "2015", "2019", "2021"], index=0)
     run_btn = st.button("🚀 Execute Alpha Tournament")
 
-# Market Date logic
 now = datetime.now()
 target_date = now if now.hour < 16 else now + timedelta(days=1)
 while target_date.weekday() >= 5: target_date += timedelta(days=1)
 
 if run_btn:
-    with st.status(f"Retraining Tournament Models (since {start_year})...") as status:
+    with st.status(f"Training Tournament Models...") as status:
         rf = get_sofr_rate(FRED_API_KEY)
         raw_data = yf.download(TARGET_ETFS + MACRO, start=f"{start_year}-01-01", progress=False)['Close'].ffill().dropna()
-        res, dates, ticker, champ, audit = run_tournament_engine(raw_data.to_json(), rf)
-        st.session_state.results = {"res": res, "dates": dates, "ticker": ticker, "champ": champ, "audit": audit, "rf": rf, "start": start_year}
+        res, dates, ticker, champ, audit, m_table = run_tournament_engine(raw_data.to_json(), rf)
+        st.session_state.results = {"res": res, "dates": dates, "ticker": ticker, "champ": champ, "audit": audit, "rf": rf, "start": start_year, "monthly": m_table}
         status.update(label=f"Champion Identified: {champ}", state="complete")
     st.rerun()
 
 if st.session_state.results:
     s = st.session_state.results
     st.header(f"🎯 Forecast for {target_date.strftime('%b %d')}: BUY {s['ticker']}")
-    st.caption("Sharpe Ratio is calculated using live SOFR from FRED")
-
+    
     m1, m2, m3 = st.columns(3)
-    champ_rets = np.array(s['res'][s['champ']])
-    m1.metric("Winner Total Return (OOS)", f"{(np.prod(1+champ_rets)-1):.2%}", delta=s['champ'])
-    m2.metric("Sharpe Ratio (Annualized)", f"{((np.mean(champ_rets)-(s['rf']/252))/np.std(champ_rets)*np.sqrt(252)):.2f}")
+    champ_rets_arr = np.array(s['res'][s['champ']])
+    m1.metric("Winner Total Return (OOS)", f"{(np.prod(1+champ_rets_arr)-1):.2%}", delta=s['champ'])
+    m2.metric("Sharpe Ratio (Annualized)", f"{((np.mean(champ_rets_arr)-(s['rf']/252))/np.std(champ_rets_arr)*np.sqrt(252)):.2f}")
     m3.metric("Live SOFR Rate", f"{s['rf']:.2%}")
 
+    # Out of Sample Cumulative Return
     fig = go.Figure()
     for name, r in s['res'].items():
         fig.add_trace(go.Scatter(x=s['dates'], y=np.cumprod(1 + np.array(r)), name=name))
-    fig.update_layout(title=f"Out of Sample Cumulative Return (Training since {s['start']})", template="plotly_dark", xaxis_title="Date", yaxis_title="Growth of $1")
+    fig.update_layout(title=f"Out of Sample Cumulative Return (Training since {s['start']})", template="plotly_dark", height=400)
     st.plotly_chart(fig, use_container_width=True)
 
-    st.subheader(f"📅 Last 15 Sessions Audit ({s['champ']})")
-    st.table(s['audit'].sort_values('Date', ascending=False).style.format({'Outcome Return': '{:.2%}'}))
+    # Monthly Returns Table
+    st.subheader(f"📅 Monthly Returns Heatmap ({s['champ']})")
+    st.dataframe(s['monthly'].style.background_gradient(cmap='RdYlGn', axis=None).format("{:.2%}"), use_container_width=True)
 
-    # --- METHODOLOGY SECTION ---
+    # 15 Day Audit with Badges
+    st.subheader(f"📊 15-Day Audit Table ({s['champ']})")
+    
+    def color_return(val):
+        color = '#d1f2eb' if val > 0 else '#fcdedc'
+        text_color = '#0e6251' if val > 0 else '#943126'
+        label = f"▲ {val:.2%}" if val > 0 else f"▼ {val:.2%}"
+        return f'background-color: {color}; color: {text_color}; border-radius: 12px; padding: 4px 10px; font-weight: bold; display: inline-block;'
+
+    # Applying custom HTML-like formatting via Pandas Styler
+    st.table(s['audit'].sort_values('Date', ascending=False).style.applymap(lambda x: 'font-weight: bold', subset=['ETF Picked'])
+             .format({'Outcome Return': '{:.2%}'})
+             .apply(lambda x: [color_return(v) if i == 'Outcome Return' else '' for i, v in x.items()], axis=1))
+
+    # Methodology Section
     st.divider()
     st.header("🔍 Methodology & Model Architecture")
-    
     col_a, col_b = st.columns(2)
     with col_a:
         st.subheader("Data Strategy: 80/20 Split")
-        st.write("""
-        The engine utilizes an **80:20 temporal split** for the selected historical period. 
-        * **80% Training:** Models consume this data to learn correlations between macro-economic signals (VIX, Treasury Rates, Dollar Index) and ETF price action.
-        * **20% Out-of-Sample (OOS):** This data is kept hidden from the models during training. It serves as a 'blind test' where models compete. The model with the highest cumulative return in this window is selected as the **Champion** for the live forecast.
-        """)
-        
+        st.write("The engine utilizes an 80:20 temporal split. 80% is used for training correlations, and 20% serves as a blind out-of-sample (OOS) test to select the Champion.")
         st.subheader("7-Day Hard Refresh")
-        st.write("""
-        To prevent 'Model Staleness,' the system is programmed with a **7-day hard refresh**. Every week, the models are completely deleted and retrained from scratch. This ensures the models continuously 'digest' the most recent market regimes, adapting to new volatility levels or interest rate shifts.
-        """)
-
+        st.write("To prevent model staleness, the system deletes and retrains all models every 7 days, ensuring they adapt to current market volatility.")
     with col_b:
         st.subheader("The Competing Models")
-        st.markdown("""
-        1. **PPO (Proximal Policy Optimization):** A Reinforcement Learning agent that uses a 'clipped' objective function to ensure stable, incremental improvements in trading policy.
-        2. **A2C (Advantage Actor-Critic):** An RL model that simultaneously learns a policy (Actor) and a value function (Critic) to reduce variance in its trade decisions.
-        3. **CNN-LSTM:** A hybrid Deep Learning architecture. The **CNN** layers extract spatial price patterns, while the **LSTM** layers capture long-term temporal trends.
-        4. **Transformer:** A state-of-the-art model utilizing 'Self-Attention' mechanisms to weigh the importance of different historical macro signals regardless of their distance in time.
-        """)
+        st.markdown("1. **PPO:** Stable RL policy optimization. \n 2. **A2C:** Advantage-based trade actor. \n 3. **CNN-LSTM:** Spatial pattern & temporal trend hybrid. \n 4. **Transformer:** Attention-based macro correlation finder.")

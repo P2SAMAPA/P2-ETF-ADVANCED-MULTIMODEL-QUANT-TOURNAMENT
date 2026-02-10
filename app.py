@@ -85,12 +85,10 @@ def run_tournament_engine(data_json, rf_rate):
     split = int(len(X_sc) * 0.8) 
     X_train, X_test, y_train, y_test = X_sc[:split], X_sc[split:], y[:split], y[split:]
 
-    # Training RL
     env = DummyVecEnv([lambda: TradingEnv(X_train, y_train, TARGET_ETFS)])
     ppo = PPO("MlpPolicy", env, verbose=0).learn(2000)
     a2c = A2C("MlpPolicy", env, verbose=0).learn(2000)
     
-    # Training DL
     dl_models = {}
     for name, m_class in [("CNN-LSTM", CNN_LSTM_Model), ("Transformer", TransformerModel)]:
         model = m_class(X.shape[1], len(TARGET_ETFS))
@@ -102,7 +100,6 @@ def run_tournament_engine(data_json, rf_rate):
             opt.step()
         dl_models[name] = model
 
-    # Tournament Competition
     results = {"PPO": [], "A2C": [], "CNN-LSTM": [], "Transformer": []}
     picks = {"PPO": [], "A2C": [], "CNN-LSTM": [], "Transformer": []}
     dates = common_idx[split:]
@@ -124,16 +121,12 @@ def run_tournament_engine(data_json, rf_rate):
     perf = {k: np.prod(1 + np.array(v)) for k, v in results.items()}
     champ = max(perf, key=perf.get)
     
-    # Heatmap logic with Geometric Yearly Compounding
     champ_series = pd.Series(results[champ], index=dates)
     monthly_rets = champ_series.groupby([champ_series.index.year, champ_series.index.month]).apply(lambda x: np.prod(1+x)-1)
     m_table = monthly_rets.unstack().fillna(0)
     m_table.columns = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][:len(m_table.columns)]
-    
-    # Geometric compounding for yearly total column
     m_table['Yearly Total'] = m_table.apply(lambda row: np.prod(1 + row) - 1, axis=1)
 
-    # Next Day Forecast
     latest_feat = X_sc[-1:]
     if champ == "PPO": f_act, _ = ppo.predict(latest_feat[0], deterministic=True)
     elif champ == "A2C": f_act, _ = a2c.predict(latest_feat[0], deterministic=True)
@@ -183,43 +176,36 @@ if st.session_state.results:
     m2.metric("Sharpe Ratio (Annualized)", f"{((np.mean(champ_rets_arr)-(s['rf']/252))/np.std(champ_rets_arr)*np.sqrt(252)):.2f}")
     m3.metric("Live SOFR Rate", f"{s['rf']:.2%}")
 
-    # Chart
     fig = go.Figure()
     for name, r in s['res'].items():
         fig.add_trace(go.Scatter(x=s['dates'], y=np.cumprod(1 + np.array(r)), name=name))
     fig.update_layout(title=f"Out of Sample Cumulative Return (Training since {s['start']})", template="plotly_dark", height=400)
     st.plotly_chart(fig, use_container_width=True)
 
-    # --- HEATMAP WITH CUSTOM COLOR SCHEME ---
     st.subheader(f"📅 Monthly Performance Matrix ({s['champ']})")
-    
     def heatmap_style(val):
         if val > 0:
             return f'background-color: rgba(0, 128, 0, {min(val*5, 0.9)}); color: white;'
         elif val < 0:
             return f'background-color: rgba(255, 0, 0, {min(abs(val)*5, 0.9)}); color: white;'
         return ''
-
     styled_monthly = s['monthly'].style.applymap(heatmap_style).format("{:.2%}")
     st.dataframe(styled_monthly, use_container_width=True)
 
-    # --- AUDIT TABLE ---
     st.subheader(f"📊 15-Day Audit Table ({s['champ']})")
     def audit_style(val):
         color = '#d1f2eb' if val > 0 else '#fcdedc'
         text_color = '#0e6251' if val > 0 else '#943126'
         return f'background-color: {color}; color: {text_color}; border-radius: 8px; font-weight: bold;'
-
     st.table(s['audit'].sort_values('Date', ascending=False).style.format({'Outcome Return': '{:.2%}'})
              .applymap(audit_style, subset=['Outcome Return']))
 
-    # Methodology
     st.divider()
     st.header("🔍 Methodology & Model Architecture")
     col_a, col_b = st.columns(2)
     with col_a:
         st.subheader("Data Strategy: 80/20 Split")
-        [cite_start]st.write("The engine utilizes an 80:20 temporal split[cite: 26]. 80% is used for training, while the remaining 20% serves as a blind test to select the Champion.")
+        st.write("The engine utilizes an 80:20 temporal split. 80% is used for training, while the remaining 20% serves as a blind test to select the Champion.")
         st.subheader("7-Day Hard Refresh")
         st.write("The system retrains all models every 7 days via a TTL cache mechanism to ensure the models stay adapted to the latest market regime.")
     with col_b:

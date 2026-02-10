@@ -56,24 +56,40 @@ def get_sofr_rate(api_key):
     except: return 0.053
 
 class TradingEnv(gym.Env):
-    def __init__(self, features, returns, etfs):
+    def __init__(self, features, returns, etfs, tcost_bps):
         super().__init__()
         self.features, self.returns, self.etfs = features, returns, etfs
+        self.tcost = tcost_bps / 10000  # Convert bps to decimal
         self.action_space = gym.spaces.Discrete(len(etfs))
         self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(features.shape[1],), dtype=np.float32)
         self.current_step = 0
+        self.last_action = None
+
     def reset(self, seed=None):
         self.current_step = 0
+        self.last_action = None
         return self.features[0], {}
+
     def step(self, action):
-        reward = float(self.returns[self.current_step, action])
+        # Base asset return
+        raw_reward = float(self.returns[self.current_step, action])
+        
+        # Friction Logic: If action changes, apply transaction cost
+        penalty = 0
+        if self.last_action is not None and action != self.last_action:
+            penalty = self.tcost
+        
+        # Reward is Pure Return minus friction
+        reward = raw_reward - penalty
+        self.last_action = action
+        
         self.current_step += 1
         done = self.current_step >= len(self.features) - 1
         return self.features[self.current_step], reward, done, False, {}
 
 # --- 4. ENGINE ---
 @st.cache_resource(ttl=604800)
-def run_tournament_engine(data_json, rf_rate):
+def run_tournament_engine(data_json, rf_rate, tcost_bps):
     data = pd.read_json(data_json)
     rets_df = data[TARGET_ETFS].pct_change().dropna()
     feats_df = data.shift(1).dropna()
@@ -85,10 +101,12 @@ def run_tournament_engine(data_json, rf_rate):
     split = int(len(X_sc) * 0.8) 
     X_train, X_test, y_train, y_test = X_sc[:split], X_sc[split:], y[:split], y[split:]
 
-    env = DummyVecEnv([lambda: TradingEnv(X_train, y_train, TARGET_ETFS)])
+    # RL Training (Pure Return Focused)
+    env = DummyVecEnv([lambda: TradingEnv(X_train, y_train, TARGET_ETFS, tcost_bps)])
     ppo = PPO("MlpPolicy", env, verbose=0).learn(2000)
     a2c = A2C("MlpPolicy", env, verbose=0).learn(2000)
     
+    # DL Training (Pure Return Focused - MSE against target returns)
     dl_models = {}
     for name, m_class in [("CNN-LSTM", CNN_LSTM_Model), ("Transformer", TransformerModel)]:
         model = m_class(X.shape[1], len(TARGET_ETFS))
@@ -96,6 +114,7 @@ def run_tournament_engine(data_json, rf_rate):
         X_t, y_t = torch.tensor(X_train).unsqueeze(1), torch.tensor(y_train).float()
         for _ in range(25): 
             opt.zero_grad()
+            # Training against raw returns (targeting maximum growth)
             nn.MSELoss()(model(X_t), y_t).backward()
             opt.step()
         dl_models[name] = model
@@ -103,36 +122,34 @@ def run_tournament_engine(data_json, rf_rate):
     results = {"PPO": [], "A2C": [], "CNN-LSTM": [], "Transformer": []}
     picks = {"PPO": [], "A2C": [], "CNN-LSTM": [], "Transformer": []}
     dates = common_idx[split:]
-    
-    for i in range(len(X_test)):
-        p_act, _ = ppo.predict(X_test[i], deterministic=True)
-        a_act, _ = a2c.predict(X_test[i], deterministic=True)
-        results["PPO"].append(y_test[i, p_act]); picks["PPO"].append(TARGET_ETFS[p_act])
-        results["A2C"].append(y_test[i, a_act]); picks["A2C"].append(TARGET_ETFS[a_act])
-        
-        with torch.no_grad():
-            x_in = torch.tensor(X_test[i]).reshape(1, 1, -1)
-            for name in ["CNN-LSTM", "Transformer"]:
-                out = dl_models[name](x_in)
-                act = torch.argmax(out).item()
-                results[name].append(y_test[i, act])
-                picks[name].append(TARGET_ETFS[act])
+    tcost_dec = tcost_bps / 10000
 
-    # --- RECENCY SCORE LOGIC (Last 15 Days) ---
+    # OOS Competition with Friction
+    for name in results.keys():
+        last_pick = None
+        for i in range(len(X_test)):
+            if name == "PPO": act, _ = ppo.predict(X_test[i], deterministic=True)
+            elif name == "A2C": act, _ = a2c.predict(X_test[i], deterministic=True)
+            else:
+                with torch.no_grad():
+                    x_in = torch.tensor(X_test[i]).reshape(1, 1, -1)
+                    out = dl_models[name](x_in)
+                    act = torch.argmax(out).item()
+            
+            day_ret = y_test[i, act]
+            if last_pick is not None and act != last_pick:
+                day_ret -= tcost_dec # Subtract friction
+            
+            results[name].append(day_ret)
+            picks[name].append(TARGET_ETFS[act])
+            last_pick = act
+
+    # Recency Score (Last 15 Days)
     recency_window = 15
-    recency_scores = {}
-    for name, rets in results.items():
-        recent_rets = np.array(rets[-recency_window:])
-        # Score = % of positive days in last 15
-        hit_rate = np.sum(recent_rets > 0) / recency_window
-        recency_scores[name] = hit_rate
+    recency_scores = {name: np.sum(np.array(rets[-recency_window:]) > 0) / recency_window for name, rets in results.items()}
 
-    # Calculate Weighted Performance (70% OOS Return, 30% Recency Score)
-    perf = {}
-    for k in results.keys():
-        total_ret = np.prod(1 + np.array(results[k])) - 1
-        perf[k] = (total_ret * 0.7) + (recency_scores[k] * 0.3)
-    
+    # Weighted Selection (Pure Return + Recency)
+    perf = {k: ( (np.prod(1 + np.array(results[k])) - 1) * 0.7) + (recency_scores[k] * 0.3) for k in results.keys()}
     champ = max(perf, key=perf.get)
     
     # Process Monthly Table
@@ -142,21 +159,17 @@ def run_tournament_engine(data_json, rf_rate):
     m_table.columns = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][:len(m_table.columns)]
     m_table['Yearly Total'] = m_table.apply(lambda row: np.prod(1 + row) - 1, axis=1)
 
+    # Forecast
     latest_feat = X_sc[-1:]
     if champ == "PPO": f_act, _ = ppo.predict(latest_feat[0], deterministic=True)
     elif champ == "A2C": f_act, _ = a2c.predict(latest_feat[0], deterministic=True)
     else: 
         with torch.no_grad():
-            f_out = dl_models[champ](torch.tensor(latest_feat).reshape(1, 1, -1))
-            f_act = torch.argmax(f_out).item()
+            f_act = torch.argmax(dl_models[champ](torch.tensor(latest_feat).reshape(1, 1, -1))).item()
 
     audit_list = []
     for j in range(len(X_test)-15, len(X_test)):
-        audit_list.append({
-            'Date': dates[j].strftime('%Y-%m-%d'),
-            'ETF Picked': picks[champ][j],
-            'Outcome Return': results[champ][j]
-        })
+        audit_list.append({'Date': dates[j].strftime('%Y-%m-%d'), 'ETF Picked': picks[champ][j], 'Outcome Return': results[champ][j]})
 
     return results, dates, TARGET_ETFS[f_act], champ, pd.DataFrame(audit_list), m_table, recency_scores[champ]
 
@@ -166,6 +179,7 @@ st.title("Alpha Tournament Pro: Multi-model ETF Forecast")
 with st.sidebar:
     st.header("Tournament Configuration")
     start_year = st.selectbox("Select Training Start Year", options=["2007", "2010", "2015", "2019", "2021"], index=0)
+    t_cost = st.slider("Transaction Cost (bps)", min_value=0, max_value=100, value=10, step=5, help="Slippage + Commission per trade entry/exit.")
     run_btn = st.button("🚀 Execute Alpha Tournament")
 
 now = datetime.now()
@@ -176,8 +190,8 @@ if run_btn:
     with st.status(f"Training Tournament Models...") as status:
         rf = get_sofr_rate(FRED_API_KEY)
         raw_data = yf.download(TARGET_ETFS + MACRO, start=f"{start_year}-01-01", progress=False)['Close'].ffill().dropna()
-        res, dates, ticker, champ, audit, m_table, r_score = run_tournament_engine(raw_data.to_json(), rf)
-        st.session_state.results = {"res": res, "dates": dates, "ticker": ticker, "champ": champ, "audit": audit, "rf": rf, "start": start_year, "monthly": m_table, "recency": r_score}
+        res, dates, ticker, champ, audit, m_table, r_score = run_tournament_engine(raw_data.to_json(), rf, t_cost)
+        st.session_state.results = {"res": res, "dates": dates, "ticker": ticker, "champ": champ, "audit": audit, "rf": rf, "start": start_year, "monthly": m_table, "recency": r_score, "t_cost": t_cost}
         status.update(label=f"Champion Identified: {champ}", state="complete")
     st.rerun()
 
@@ -187,19 +201,17 @@ if st.session_state.results:
     
     m1, m2, m3, m4 = st.columns(4)
     champ_rets_arr = np.array(s['res'][s['champ']])
-    m1.metric("Winner Total Return", f"{(np.prod(1+champ_rets_arr)-1):.2%}", delta=s['champ'])
-    m2.metric("Sharpe (Annualized)", f"{((np.mean(champ_rets_arr)-(s['rf']/252))/np.std(champ_rets_arr)*np.sqrt(252)):.2f}")
-    m3.metric("Live SOFR Rate", f"{s['rf']:.2%}")
-    m4.metric("Recency Score (15d)", f"{s['recency']:.0%}", help="Percentage of winning days in the last 15 sessions")
+    m1.metric("Winner Total Return (Net)", f"{(np.prod(1+champ_rets_arr)-1):.2%}", delta=s['champ'])
+    m2.metric("Sharpe (Info Only)", f"{((np.mean(champ_rets_arr)-(s['rf']/252))/np.std(champ_rets_arr)*np.sqrt(252)):.2f}")
+    m3.metric("Recency Score (15d)", f"{s['recency']:.0%}")
+    m4.metric("Friction Applied", f"{s['t_cost']} bps")
 
-    # Chart
     fig = go.Figure()
     for name, r in s['res'].items():
         fig.add_trace(go.Scatter(x=s['dates'], y=np.cumprod(1 + np.array(r)), name=name))
-    fig.update_layout(title="Out of Sample Cumulative Return", template="plotly_dark", height=400)
+    fig.update_layout(title=f"Cumulative Net Return (Friction: {s['t_cost']}bps)", template="plotly_dark", height=400)
     st.plotly_chart(fig, use_container_width=True)
 
-    # Heatmap
     st.subheader(f"📅 Monthly Performance Matrix ({s['champ']})")
     def heatmap_style(val):
         alpha = min(abs(val)*6, 0.9)
@@ -209,7 +221,6 @@ if st.session_state.results:
         return 'color: black;'
     st.dataframe(s['monthly'].style.applymap(heatmap_style).format("{:.2%}"), use_container_width=True)
 
-    # Audit
     st.subheader(f"📊 15-Day Audit Table ({s['champ']})")
     def audit_style(val):
         color = '#d1f2eb' if val > 0 else '#fcdedc'
@@ -217,18 +228,14 @@ if st.session_state.results:
         return f'background-color: {color}; color: {text_color}; border-radius: 8px; font-weight: bold;'
     st.table(s['audit'].sort_values('Date', ascending=False).style.format({'Outcome Return': '{:.2%}'}).applymap(audit_style, subset=['Outcome Return']))
 
-    # --- METHODOLOGY ---
     st.divider()
     st.header("🔍 Methodology & Model Architecture")
     col_a, col_b = st.columns(2)
     with col_a:
-        st.subheader("Post-Prediction Layer: Recency Score")
-        st.write("""
-        This engine employs a **Recency Score weighted selection**. Instead of picking the Champion based solely on long-term OOS performance, we apply a 30% weight to the model's 'Hit Rate' over the last 15 sessions. 
-        This ensures the selected Champion isn't just a historical winner, but is actively 'in sync' with the current market regime.
-        """)
-        st.subheader("Data Strategy & Refresh")
-        st.write("80:20 temporal split. 7-Day Hard Refresh via TTL cache to prevent model staleness.")
+        st.subheader("Transaction Friction & Pure Returns")
+        st.write(f"Models are trained to chase pure cumulative returns. A friction cost of **{s['t_cost']} bps** is applied to every trade change, discouraging high-frequency turnover.")
+        st.subheader("Post-Prediction Layer")
+        st.write("Champion selection uses a 70/30 blend of OOS Return and a 15-day Recency Score (hit rate).")
     with col_b:
         st.subheader("The Competing Models")
-        st.markdown("1. **PPO & A2C:** Reinforcement Learning agents. \n 2. **CNN-LSTM:** Spatial-temporal hybrid. \n 3. **Transformer:** Attention-based correlation engine.")
+        st.markdown("1. **PPO & A2C:** RL agents optimized for growth. \n 2. **CNN-LSTM:** Spatial-temporal pattern learner. \n 3. **Transformer:** Attention-based correlation finder.")

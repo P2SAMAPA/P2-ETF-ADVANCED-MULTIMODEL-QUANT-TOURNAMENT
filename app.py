@@ -118,7 +118,21 @@ def run_tournament_engine(data_json, rf_rate):
                 results[name].append(y_test[i, act])
                 picks[name].append(TARGET_ETFS[act])
 
-    perf = {k: np.prod(1 + np.array(v)) for k, v in results.items()}
+    # --- RECENCY SCORE LOGIC (Last 15 Days) ---
+    recency_window = 15
+    recency_scores = {}
+    for name, rets in results.items():
+        recent_rets = np.array(rets[-recency_window:])
+        # Score = % of positive days in last 15
+        hit_rate = np.sum(recent_rets > 0) / recency_window
+        recency_scores[name] = hit_rate
+
+    # Calculate Weighted Performance (70% OOS Return, 30% Recency Score)
+    perf = {}
+    for k in results.keys():
+        total_ret = np.prod(1 + np.array(results[k])) - 1
+        perf[k] = (total_ret * 0.7) + (recency_scores[k] * 0.3)
+    
     champ = max(perf, key=perf.get)
     
     # Process Monthly Table
@@ -144,10 +158,10 @@ def run_tournament_engine(data_json, rf_rate):
             'Outcome Return': results[champ][j]
         })
 
-    return results, dates, TARGET_ETFS[f_act], champ, pd.DataFrame(audit_list), m_table
+    return results, dates, TARGET_ETFS[f_act], champ, pd.DataFrame(audit_list), m_table, recency_scores[champ]
 
 # --- 5. UI ---
-st.title("Multi-model (DL & ML) Tournament for Prediction of ETF Returns")
+st.title("Alpha Tournament Pro: Multi-model ETF Forecast")
 
 with st.sidebar:
     st.header("Tournament Configuration")
@@ -162,8 +176,8 @@ if run_btn:
     with st.status(f"Training Tournament Models...") as status:
         rf = get_sofr_rate(FRED_API_KEY)
         raw_data = yf.download(TARGET_ETFS + MACRO, start=f"{start_year}-01-01", progress=False)['Close'].ffill().dropna()
-        res, dates, ticker, champ, audit, m_table = run_tournament_engine(raw_data.to_json(), rf)
-        st.session_state.results = {"res": res, "dates": dates, "ticker": ticker, "champ": champ, "audit": audit, "rf": rf, "start": start_year, "monthly": m_table}
+        res, dates, ticker, champ, audit, m_table, r_score = run_tournament_engine(raw_data.to_json(), rf)
+        st.session_state.results = {"res": res, "dates": dates, "ticker": ticker, "champ": champ, "audit": audit, "rf": rf, "start": start_year, "monthly": m_table, "recency": r_score}
         status.update(label=f"Champion Identified: {champ}", state="complete")
     st.rerun()
 
@@ -171,50 +185,50 @@ if st.session_state.results:
     s = st.session_state.results
     st.header(f"🎯 Forecast for {target_date.strftime('%b %d')}: BUY {s['ticker']}")
     
-    m1, m2, m3 = st.columns(3)
+    m1, m2, m3, m4 = st.columns(4)
     champ_rets_arr = np.array(s['res'][s['champ']])
-    m1.metric("Winner Total Return (OOS)", f"{(np.prod(1+champ_rets_arr)-1):.2%}", delta=s['champ'])
-    m2.metric("Sharpe Ratio (Annualized)", f"{((np.mean(champ_rets_arr)-(s['rf']/252))/np.std(champ_rets_arr)*np.sqrt(252)):.2f}")
+    m1.metric("Winner Total Return", f"{(np.prod(1+champ_rets_arr)-1):.2%}", delta=s['champ'])
+    m2.metric("Sharpe (Annualized)", f"{((np.mean(champ_rets_arr)-(s['rf']/252))/np.std(champ_rets_arr)*np.sqrt(252)):.2f}")
     m3.metric("Live SOFR Rate", f"{s['rf']:.2%}")
+    m4.metric("Recency Score (15d)", f"{s['recency']:.0%}", help="Percentage of winning days in the last 15 sessions")
 
+    # Chart
     fig = go.Figure()
     for name, r in s['res'].items():
         fig.add_trace(go.Scatter(x=s['dates'], y=np.cumprod(1 + np.array(r)), name=name))
-    fig.update_layout(title=f"Out of Sample Cumulative Return (Training since {s['start']})", template="plotly_dark", height=400)
+    fig.update_layout(title="Out of Sample Cumulative Return", template="plotly_dark", height=400)
     st.plotly_chart(fig, use_container_width=True)
 
-    # --- HEATMAP WITH CONTRAST CORRECTION ---
+    # Heatmap
     st.subheader(f"📅 Monthly Performance Matrix ({s['champ']})")
     def heatmap_style(val):
-        alpha = min(abs(val)*6, 0.9) # Scaled alpha
-        text_color = "white" if alpha > 0.45 else "black" # High-contrast trigger
-        if val > 0:
-            return f'background-color: rgba(0, 128, 0, {alpha}); color: {text_color};'
-        elif val < 0:
-            return f'background-color: rgba(255, 0, 0, {alpha}); color: {text_color};'
+        alpha = min(abs(val)*6, 0.9)
+        text_color = "white" if alpha > 0.45 else "black"
+        if val > 0: return f'background-color: rgba(0, 128, 0, {alpha}); color: {text_color};'
+        elif val < 0: return f'background-color: rgba(255, 0, 0, {alpha}); color: {text_color};'
         return 'color: black;'
+    st.dataframe(s['monthly'].style.applymap(heatmap_style).format("{:.2%}"), use_container_width=True)
 
-    styled_monthly = s['monthly'].style.applymap(heatmap_style).format("{:.2%}")
-    st.dataframe(styled_monthly, use_container_width=True)
-
-    # --- AUDIT TABLE ---
+    # Audit
     st.subheader(f"📊 15-Day Audit Table ({s['champ']})")
     def audit_style(val):
         color = '#d1f2eb' if val > 0 else '#fcdedc'
         text_color = '#0e6251' if val > 0 else '#943126'
         return f'background-color: {color}; color: {text_color}; border-radius: 8px; font-weight: bold;'
-    
-    st.table(s['audit'].sort_values('Date', ascending=False).style.format({'Outcome Return': '{:.2%}'})
-             .applymap(audit_style, subset=['Outcome Return']))
+    st.table(s['audit'].sort_values('Date', ascending=False).style.format({'Outcome Return': '{:.2%}'}).applymap(audit_style, subset=['Outcome Return']))
 
+    # --- METHODOLOGY ---
     st.divider()
     st.header("🔍 Methodology & Model Architecture")
     col_a, col_b = st.columns(2)
     with col_a:
-        st.subheader("Data Strategy: 80/20 Split")
-        st.write("The engine utilizes an 80:20 temporal split. 80% is used for training, while the remaining 20% serves as a blind test to select the Champion.")
-        st.subheader("7-Day Hard Refresh")
-        st.write("The system retrains all models every 7 days via a TTL cache mechanism to ensure the models stay adapted to the latest market regime.")
+        st.subheader("Post-Prediction Layer: Recency Score")
+        st.write("""
+        This engine employs a **Recency Score weighted selection**. Instead of picking the Champion based solely on long-term OOS performance, we apply a 30% weight to the model's 'Hit Rate' over the last 15 sessions. 
+        This ensures the selected Champion isn't just a historical winner, but is actively 'in sync' with the current market regime.
+        """)
+        st.subheader("Data Strategy & Refresh")
+        st.write("80:20 temporal split. 7-Day Hard Refresh via TTL cache to prevent model staleness.")
     with col_b:
         st.subheader("The Competing Models")
-        st.markdown("1. **PPO:** Stable RL policy optimization. \n 2. **A2C:** Actor-critic RL agent. \n 3. **CNN-LSTM:** Spatial-temporal pattern learner. \n 4. **Transformer:** Attention-based macro correlation finder.")
+        st.markdown("1. **PPO & A2C:** Reinforcement Learning agents. \n 2. **CNN-LSTM:** Spatial-temporal hybrid. \n 3. **Transformer:** Attention-based correlation engine.")

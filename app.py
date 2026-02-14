@@ -137,16 +137,6 @@ def load_data_from_hf(start_year, hf_token, dataset_repo):
         st.code(traceback.format_exc())
         return None, None
 
-def calculate_momentum_features(data, lookback_periods=[30, 45, 60]):
-    """Calculate momentum features for multiple lookback periods"""
-    momentum_features = {}
-    
-    for period in lookback_periods:
-        momentum = data.pct_change(period)
-        momentum_features[f'momentum_{period}d'] = momentum
-    
-    return momentum_features
-
 class TradingEnv(gym.Env):
     def __init__(self, features, returns, etfs, tcost_bps):
         super().__init__()
@@ -381,7 +371,6 @@ def run_tournament_engine(features_json, returns_json, rf_rate, tcost_bps, start
     }
 
     return results, test_dates, forecasts, champ, runner_up, m_table, recency_scores, oos_years, diagnostics
-    return results, test_dates, forecasts, champ, runner_up, m_table, recency_scores, oos_years, diagnostics
 
 # --- 5. UI ---
 st.title("Alpha Tournament Pro: Multi-model ETF Forecast")
@@ -436,12 +425,20 @@ if run_btn:
 if st.session_state.results:
     s = st.session_state.results
     
+    # Calculate OOS period length in years
+    oos_years_count = int(s['oos_years'].split('-')[1]) - int(s['oos_years'].split('-')[0]) + 1 if '-' in s['oos_years'] else 1
+    
     # --- CHAMPION ROW ---
     st.subheader(f"🏆 Champion: {s['champ']}")
     c1, c2, c3, c4 = st.columns(4)
     c_rets = np.array(s['res'][s['champ']])
+    
+    # Calculate annualized return
+    total_return_c = np.prod(1+c_rets) - 1
+    annualized_return_c = (1 + total_return_c) ** (1 / oos_years_count) - 1
+    
     c1.metric(f"PREDICTION", s['fcasts'][s['champ']], delta=f"Valid: {s['next_day']}")
-    c2.metric("Total Return (Net)", f"{(np.prod(1+c_rets)-1):.2%}", delta=f"OOS: {s['oos_years']}")
+    c2.metric("Annualized Return (Net)", f"{annualized_return_c:.2%}", delta=f"OOS: {s['oos_years']}")
     c3.metric("Sharpe (Annualized)", f"{((np.mean(c_rets)-(s['rf']/252))/np.std(c_rets)*np.sqrt(252)):.2f}", delta=f"SOFR: {s['rf']:.2%}", delta_color="normal")
     c4.metric("Recency Score (15d)", f"{s['recency'][s['champ']]:.0%}")
 
@@ -449,8 +446,13 @@ if st.session_state.results:
     st.subheader(f"🥈 Runner-Up: {s['runner']}")
     r1, r2, r3, r4 = st.columns(4)
     r_rets = np.array(s['res'][s['runner']])
+    
+    # Calculate annualized return
+    total_return_r = np.prod(1+r_rets) - 1
+    annualized_return_r = (1 + total_return_r) ** (1 / oos_years_count) - 1
+    
     r1.metric(f"PREDICTION", s['fcasts'][s['runner']], delta=f"Valid: {s['next_day']}")
-    r2.metric("Total Return (Net)", f"{(np.prod(1+r_rets)-1):.2%}", delta=f"OOS: {s['oos_years']}")
+    r2.metric("Annualized Return (Net)", f"{annualized_return_r:.2%}", delta=f"OOS: {s['oos_years']}")
     r3.metric("Sharpe (Annualized)", f"{((np.mean(r_rets)-(s['rf']/252))/np.std(r_rets)*np.sqrt(252)):.2f}", delta=f"SOFR: {s['rf']:.2%}", delta_color="normal")
     r4.metric("Recency Score (15d)", f"{s['recency'][s['runner']]:.0%}")
 

@@ -86,6 +86,12 @@ def load_data_from_hf(start_year, hf_token, dataset_repo):
         # Convert to pandas DataFrame
         df = dataset.to_pandas()
         
+        # DEBUG: Show what columns we actually have
+        st.write("🔍 DEBUG - Available columns:", df.columns.tolist())
+        st.write("🔍 DEBUG - First few rows:")
+        st.dataframe(df.head())
+        st.write("🔍 DEBUG - Data shape:", df.shape)
+        
         # Set index to date column (adjust column name if different)
         if 'date' in df.columns:
             df['date'] = pd.to_datetime(df['date'])
@@ -115,6 +121,9 @@ def load_data_from_hf(start_year, hf_token, dataset_repo):
         return df, "HuggingFace Dataset"
     except Exception as e:
         st.warning(f"Could not load from HF dataset: {str(e)}")
+        st.error(f"Full error details: {str(e)}")
+        import traceback
+        st.code(traceback.format_exc())
         return None, None
 
 def fetch_alpha_vantage_data(tickers, start_date, api_key):
@@ -383,7 +392,7 @@ st.title("Alpha Tournament Pro: Multi-model ETF Forecast")
 with st.sidebar:
     st.header("Tournament Configuration")
     
-    # CHANGED: Slider instead of dropdown
+    # Slider instead of dropdown
     start_year = st.slider(
         "Select Training Start Year", 
         min_value=2008, 

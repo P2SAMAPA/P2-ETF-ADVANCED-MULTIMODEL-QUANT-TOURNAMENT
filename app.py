@@ -11,7 +11,6 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 import requests
 import pandas_market_calendars as mcal
-from huggingface_hub import hf_hub_download
 from datasets import load_dataset
 import os
 from io import StringIO
@@ -22,11 +21,9 @@ st.set_page_config(page_title="Alpha Tournament Pro", layout="wide")
 if 'results' not in st.session_state: st.session_state.results = None
 
 TARGET_ETFS = ['TLT', 'TBT', 'VNQ', 'GLD', 'SLV']
-MACRO = ['^VIX', '^TNX', 'DX-Y.NYB']
 
 # Get secrets from HF Spaces
 FRED_API_KEY = os.environ.get("FRED_API_KEY")
-ALPHA_VANTAGE_KEY = os.environ.get("ALPHA_VANTAGE_KEY")
 HF_TOKEN = os.environ.get("HF_KEY")
 HF_DATASET_REPO = "P2SAMAPA/my-etf-data"
 
@@ -86,93 +83,59 @@ def load_data_from_hf(start_year, hf_token, dataset_repo):
         # Convert to pandas DataFrame
         df = dataset.to_pandas()
         
-        # DEBUG: Show what columns we actually have
-        st.write("🔍 DEBUG - Available columns:", df.columns.tolist())
-        st.write("🔍 DEBUG - First few rows:")
-        st.dataframe(df.head())
-        st.write("🔍 DEBUG - Data shape:", df.shape)
-        
-        # Set index to date column (adjust column name if different)
-        if 'date' in df.columns:
-            df['date'] = pd.to_datetime(df['date'])
-            df = df.set_index('date')
-        elif 'Date' in df.columns:
+        # Set Date as index
+        if 'Date' in df.columns:
             df['Date'] = pd.to_datetime(df['Date'])
             df = df.set_index('Date')
-        else:
-            # If no date column, assume index is already datetime
-            df.index = pd.to_datetime(df.index)
+        elif 'date' in df.columns:
+            df['date'] = pd.to_datetime(df['date'])
+            df = df.set_index('date')
         
         # Filter data from start_year onwards
         df = df[df.index >= f'{start_year}-01-01']
         df = df.sort_index()
         
-        # Ensure we have the required columns
-        required_cols = TARGET_ETFS + MACRO
-        missing_cols = [col for col in required_cols if col not in df.columns]
-        if missing_cols:
-            st.warning(f"Missing columns in dataset: {missing_cols}")
+        # Select the columns we need: returns and features
+        ret_cols = [f'{etf}_Ret' for etf in TARGET_ETFS]
+        feature_cols = []
+        for etf in TARGET_ETFS:
+            feature_cols.extend([f'{etf}_MA20', f'{etf}_Vol'])
+        feature_cols.extend(['UNRATE', 'CPI'])
+        
+        # Check all columns exist
+        all_cols = ret_cols + feature_cols
+        missing = [c for c in all_cols if c not in df.columns]
+        if missing:
+            st.error(f"Missing columns: {missing}")
             return None, None
         
-        # Select only required columns
-        df = df[required_cols]
-        df = df.ffill().dropna()
+        # Create returns dataframe (for targets)
+        returns_df = df[ret_cols].copy()
+        returns_df.columns = TARGET_ETFS  # Rename to simple ETF names
         
-        return df, "HuggingFace Dataset"
+        # Create features dataframe
+        features_df = df[feature_cols].copy()
+        
+        # Forward fill and drop NaN
+        returns_df = returns_df.ffill().dropna()
+        features_df = features_df.ffill().dropna()
+        
+        # Align indices
+        common_idx = returns_df.index.intersection(features_df.index)
+        returns_df = returns_df.loc[common_idx]
+        features_df = features_df.loc[common_idx]
+        
+        if len(returns_df) < 100:
+            st.error(f"Insufficient data after filtering: {len(returns_df)} rows")
+            return None, None
+        
+        return (features_df, returns_df), "HuggingFace Dataset"
+        
     except Exception as e:
-        st.warning(f"Could not load from HF dataset: {str(e)}")
-        st.error(f"Full error details: {str(e)}")
+        st.error(f"Error loading from HF dataset: {str(e)}")
         import traceback
         st.code(traceback.format_exc())
         return None, None
-
-def fetch_alpha_vantage_data(tickers, start_date, api_key):
-    """Fetch data from Alpha Vantage as fallback"""
-    if not api_key:
-        return None
-    
-    all_data = {}
-    import time
-    for ticker in tickers:
-        try:
-            clean_ticker = ticker.replace('^', '')
-            url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY_ADJUSTED&symbol={clean_ticker}&outputsize=full&apikey={api_key}"
-            r = requests.get(url, timeout=15).json()
-            
-            if 'Time Series (Daily)' not in r:
-                continue
-                
-            ts_data = r['Time Series (Daily)']
-            df = pd.DataFrame.from_dict(ts_data, orient='index')
-            df.index = pd.to_datetime(df.index)
-            df = df.sort_index()
-            df = df[df.index >= start_date]
-            all_data[ticker] = df['5. adjusted close'].astype(float)
-            time.sleep(13)
-        except:
-            continue
-    
-    if len(all_data) > 0:
-        return pd.DataFrame(all_data)
-    return None
-
-def fetch_market_data(start_year, hf_token, av_key, dataset_repo):
-    """Fetch data with HF primary, Alpha Vantage fallback"""
-    # Try HF dataset first
-    data, data_source = load_data_from_hf(start_year, hf_token, dataset_repo)
-    
-    if data is not None and len(data) >= 100:
-        return data, data_source
-    
-    # Fallback to Alpha Vantage
-    st.warning("HF dataset not available, trying Alpha Vantage fallback...")
-    data_source = "Alpha Vantage (fallback)"
-    data = fetch_alpha_vantage_data(TARGET_ETFS + MACRO, f"{start_year}-01-01", av_key)
-    
-    if data is None or len(data) < 100:
-        raise Exception("Unable to fetch sufficient data from both HF and Alpha Vantage. Please try again later.")
-    
-    return data, data_source
 
 def calculate_momentum_features(data, lookback_periods=[30, 45, 60]):
     """Calculate momentum features for multiple lookback periods"""
@@ -210,17 +173,18 @@ class TradingEnv(gym.Env):
 
 # --- 4. ENGINE ---
 @st.cache_resource(ttl=604800)
-def run_tournament_engine(data_json, rf_rate, tcost_bps, start_year, data_source):
-    data = pd.read_json(StringIO(data_json))
+def run_tournament_engine(features_json, returns_json, rf_rate, tcost_bps, start_year, data_source):
+    features_df = pd.read_json(StringIO(features_json))
+    returns_df = pd.read_json(StringIO(returns_json))
     
     # Track data transformations for diagnostics
-    raw_start = data.index[0].strftime('%Y-%m-%d')
-    raw_end = data.index[-1].strftime('%Y-%m-%d')
-    raw_rows = len(data)
+    raw_start = features_df.index[0].strftime('%Y-%m-%d')
+    raw_end = features_df.index[-1].strftime('%Y-%m-%d')
+    raw_rows = len(features_df)
     
     # Calculate momentum features for different lookback periods
     lookback_periods = [30, 45, 60]
-    momentum_dict = calculate_momentum_features(data, lookback_periods)
+    momentum_dict = calculate_momentum_features(features_df, lookback_periods)
     
     # Test each lookback period to find best performing one
     best_lookback = None
@@ -228,16 +192,16 @@ def run_tournament_engine(data_json, rf_rate, tcost_bps, start_year, data_source
     
     for period in lookback_periods:
         momentum_data = momentum_dict[f'momentum_{period}d']
-        combined_data = pd.concat([data, momentum_data.add_suffix(f'_mom{period}')], axis=1).dropna()
+        combined_data = pd.concat([features_df, momentum_data.add_suffix(f'_mom{period}')], axis=1).dropna()
         
         if len(combined_data) < 100:
             continue
-            
-        # Quick validation score using simple correlation
-        rets = combined_data[TARGET_ETFS].pct_change().dropna()
+        
+        # Quick validation score using correlation
+        aligned_returns = returns_df.loc[combined_data.index]
         mom_cols = [col for col in combined_data.columns if f'_mom{period}' in col]
-        if len(rets) > 0 and len(mom_cols) > 0:
-            score = np.abs(combined_data[mom_cols].corrwith(rets[TARGET_ETFS[0]])).mean()
+        if len(aligned_returns) > 0 and len(mom_cols) > 0:
+            score = np.abs(combined_data[mom_cols].corrwith(aligned_returns.iloc[:, 0])).mean()
             if score > best_score:
                 best_score = score
                 best_lookback = period
@@ -248,17 +212,16 @@ def run_tournament_engine(data_json, rf_rate, tcost_bps, start_year, data_source
     
     # Build final dataset with best lookback
     momentum_data = momentum_dict[f'momentum_{best_lookback}d']
-    data_with_momentum = pd.concat([data, momentum_data.add_suffix(f'_mom{best_lookback}')], axis=1).dropna()
+    features_with_momentum = pd.concat([features_df, momentum_data.add_suffix(f'_mom{best_lookback}')], axis=1).dropna()
     
-    rets_df = data_with_momentum[TARGET_ETFS].pct_change().dropna()
-    feats_df = data_with_momentum.shift(1).dropna()
-    common_idx = rets_df.index.intersection(feats_df.index)
+    # Align features and returns
+    common_idx = features_with_momentum.index.intersection(returns_df.index)
+    X = features_with_momentum.loc[common_idx].values
+    y = returns_df.loc[common_idx].values
     
-    # More diagnostics
+    # Diagnostics
     after_processing_start = common_idx[0].strftime('%Y-%m-%d')
     after_processing_rows = len(common_idx)
-    
-    X, y = feats_df.loc[common_idx].values, rets_df.loc[common_idx].values
     
     scaler = StandardScaler()
     X_sc = scaler.fit_transform(X).astype(np.float32)
@@ -334,7 +297,7 @@ def run_tournament_engine(data_json, rf_rate, tcost_bps, start_year, data_source
             results[name].append(day_ret)
             last_pick = act
 
-    # OOS period calculation using actual test dates
+    # OOS period calculation
     oos_start_year = test_dates[0].year
     oos_end_year = test_dates[-1].year
     oos_years = f"{oos_start_year}-{oos_end_year}" if oos_start_year != oos_end_year else str(oos_start_year)
@@ -392,7 +355,6 @@ st.title("Alpha Tournament Pro: Multi-model ETF Forecast")
 with st.sidebar:
     st.header("Tournament Configuration")
     
-    # Slider instead of dropdown
     start_year = st.slider(
         "Select Training Start Year", 
         min_value=2008, 
@@ -409,8 +371,19 @@ if run_btn:
     with st.status(f"Training Tournament Models...") as status:
         try:
             rf = get_sofr_rate(FRED_API_KEY)
-            raw_data, data_src = fetch_market_data(start_year, HF_TOKEN, ALPHA_VANTAGE_KEY, HF_DATASET_REPO)
-            res, dates, fcasts, champ, runner, m_table, r_scores, oos_years, diag = run_tournament_engine(raw_data.to_json(), rf, t_cost, start_year, data_src)
+            data_tuple = load_data_from_hf(start_year, HF_TOKEN, HF_DATASET_REPO)
+            
+            if data_tuple[0] is None:
+                st.error("Failed to load data from HuggingFace dataset")
+                st.stop()
+            
+            (features_df, returns_df), data_src = data_tuple
+            
+            res, dates, fcasts, champ, runner, m_table, r_scores, oos_years, diag = run_tournament_engine(
+                features_df.to_json(), 
+                returns_df.to_json(), 
+                rf, t_cost, start_year, data_src
+            )
             next_trade_day = get_next_trading_day()
             st.session_state.results = {
                 "res": res, "dates": dates, "fcasts": fcasts, "champ": champ, "runner": runner, 
@@ -421,6 +394,8 @@ if run_btn:
         except Exception as e:
             status.update(label=f"Error: {str(e)}", state="error")
             st.error(f"Failed to run tournament: {str(e)}")
+            import traceback
+            st.code(traceback.format_exc())
             st.stop()
     st.rerun()
 
@@ -487,7 +462,7 @@ if st.session_state.results:
         diag = s['diagnostics']
         
         if diag['requested_start'] != diag['actual_start']:
-            st.warning(f"⚠️ **Data Availability Notice:** Data requested from {diag['requested_start']}, but actual usable data starts from {diag['actual_start']} due to instrument availability and momentum calculation requirements.")
+            st.warning(f"⚠️ **Data Availability Notice:** Data requested from {diag['requested_start']}, but actual usable data starts from {diag['actual_start']} due to momentum calculation requirements.")
         
         col_a, col_b, col_c = st.columns(3)
         with col_a:

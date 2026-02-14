@@ -11,7 +11,8 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 import requests
 import pandas_market_calendars as mcal
-from huggingface_hub import hf_hub_download, HfApi
+from huggingface_hub import hf_hub_download
+from datasets import load_dataset
 import os
 from io import StringIO
 
@@ -79,18 +80,41 @@ def get_next_trading_day():
 def load_data_from_hf(start_year, hf_token, dataset_repo):
     """Load data from HuggingFace dataset"""
     try:
-        # Download the dataset file
-        file_path = hf_hub_download(
-            repo_id=dataset_repo,
-            filename=f"etf_data_{start_year}.parquet",
-            repo_type="dataset",
-            token=hf_token
-        )
-        data = pd.read_parquet(file_path)
-        data.index = pd.to_datetime(data.index)
-        return data, "HuggingFace Dataset"
+        # Load the dataset from HF
+        dataset = load_dataset(dataset_repo, split='train', token=hf_token)
+        
+        # Convert to pandas DataFrame
+        df = dataset.to_pandas()
+        
+        # Set index to date column (adjust column name if different)
+        if 'date' in df.columns:
+            df['date'] = pd.to_datetime(df['date'])
+            df = df.set_index('date')
+        elif 'Date' in df.columns:
+            df['Date'] = pd.to_datetime(df['Date'])
+            df = df.set_index('Date')
+        else:
+            # If no date column, assume index is already datetime
+            df.index = pd.to_datetime(df.index)
+        
+        # Filter data from start_year onwards
+        df = df[df.index >= f'{start_year}-01-01']
+        df = df.sort_index()
+        
+        # Ensure we have the required columns
+        required_cols = TARGET_ETFS + MACRO
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        if missing_cols:
+            st.warning(f"Missing columns in dataset: {missing_cols}")
+            return None, None
+        
+        # Select only required columns
+        df = df[required_cols]
+        df = df.ffill().dropna()
+        
+        return df, "HuggingFace Dataset"
     except Exception as e:
-        st.warning(f"Could not load from HF dataset: {str(e)[:100]}")
+        st.warning(f"Could not load from HF dataset: {str(e)}")
         return None, None
 
 def fetch_alpha_vantage_data(tickers, start_date, api_key):
@@ -358,7 +382,17 @@ st.title("Alpha Tournament Pro: Multi-model ETF Forecast")
 
 with st.sidebar:
     st.header("Tournament Configuration")
-    start_year = st.selectbox("Select Training Start Year", options=["2007", "2010", "2015", "2019", "2021"], index=0)
+    
+    # CHANGED: Slider instead of dropdown
+    start_year = st.slider(
+        "Select Training Start Year", 
+        min_value=2008, 
+        max_value=2024,
+        value=2015,
+        step=1,
+        help="Choose the year from which to start training the models"
+    )
+    
     t_cost = st.slider("Transaction Cost (bps)", min_value=0, max_value=100, value=10, step=5)
     run_btn = st.button("🚀 Execute Alpha Tournament")
 

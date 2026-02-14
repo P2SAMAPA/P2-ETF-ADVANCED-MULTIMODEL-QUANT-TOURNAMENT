@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 import requests
 import pandas_market_calendars as mcal
 import time
+from io import StringIO
 
 # --- 1. SETTINGS & STATE ---
 st.set_page_config(page_title="Alpha Tournament Pro", layout="wide")
@@ -59,14 +60,17 @@ def get_sofr_rate(api_key):
     except: return 0.053
 
 def get_next_trading_day():
-    nyse = mcal.get_calendar('NYSE')
-    today = pd.Timestamp.now(tz='America/New_York').normalize()
-    schedule = nyse.schedule(start_date=today, end_date=today + timedelta(days=10))
-    valid_days = mcal.date_range(schedule, frequency='1D')
-    for day in valid_days:
-        if day.normalize() > today:
-            return day.strftime('%Y-%m-%d')
-    return (today + timedelta(days=1)).strftime('%Y-%m-%d')
+    try:
+        nyse = mcal.get_calendar('NYSE')
+        today = pd.Timestamp.now(tz='America/New_York').normalize()
+        schedule = nyse.schedule(start_date=today, end_date=today + timedelta(days=10))
+        valid_days = mcal.date_range(schedule, frequency='1D')
+        for day in valid_days:
+            if day.normalize() > today:
+                return day.strftime('%Y-%m-%d')
+    except:
+        pass
+    return (pd.Timestamp.now() + timedelta(days=1)).strftime('%Y-%m-%d')
 
 def fetch_alpha_vantage_data(tickers, start_date, api_key):
     """Fetch data from Alpha Vantage as fallback"""
@@ -76,7 +80,9 @@ def fetch_alpha_vantage_data(tickers, start_date, api_key):
     all_data = {}
     for ticker in tickers:
         try:
-            url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY_ADJUSTED&symbol={ticker}&outputsize=full&apikey={api_key}"
+            # Clean ticker for Alpha Vantage
+            clean_ticker = ticker.replace('^', '')
+            url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY_ADJUSTED&symbol={clean_ticker}&outputsize=full&apikey={api_key}"
             r = requests.get(url, timeout=15).json()
             
             if 'Time Series (Daily)' not in r:
@@ -88,7 +94,7 @@ def fetch_alpha_vantage_data(tickers, start_date, api_key):
             df = df.sort_index()
             df = df[df.index >= start_date]
             all_data[ticker] = df['5. adjusted close'].astype(float)
-            time.sleep(12)  # Alpha Vantage rate limit
+            time.sleep(13)  # Alpha Vantage rate limit (5 calls/min)
         except:
             continue
     
@@ -101,19 +107,26 @@ def fetch_market_data(tickers, start_date, av_key):
     data_source = "yfinance"
     
     try:
-        data = yf.download(tickers, start=start_date, progress=False)['Close']
+        data = yf.download(tickers, start=start_date, progress=False, auto_adjust=True)
+        if len(tickers) == 1:
+            data = pd.DataFrame({'Close': data['Close']})
+        else:
+            data = data['Close']
+        
         if isinstance(data, pd.Series):
             data = data.to_frame()
+        
         data = data.ffill().dropna()
         
         if len(data) < 100:
             raise Exception("Insufficient data from yfinance")
             
     except Exception as e:
+        st.warning(f"yfinance failed, trying Alpha Vantage fallback... ({str(e)[:100]})")
         data_source = "Alpha Vantage (fallback)"
         data = fetch_alpha_vantage_data(tickers, start_date, av_key)
         if data is None or len(data) < 100:
-            raise Exception("Unable to fetch sufficient data from both sources")
+            raise Exception("Unable to fetch sufficient data from both sources. Please try again later.")
     
     return data, data_source
 
@@ -154,7 +167,7 @@ class TradingEnv(gym.Env):
 # --- 4. ENGINE ---
 @st.cache_resource(ttl=604800)
 def run_tournament_engine(data_json, rf_rate, tcost_bps, start_year, data_source):
-    data = pd.read_json(data_json)
+    data = pd.read_json(StringIO(data_json))
     
     # Track data transformations for diagnostics
     raw_start = data.index[0].strftime('%Y-%m-%d')
@@ -340,16 +353,21 @@ with st.sidebar:
 
 if run_btn:
     with st.status(f"Training Tournament Models...") as status:
-        rf = get_sofr_rate(FRED_API_KEY)
-        raw_data, data_src = fetch_market_data(TARGET_ETFS + MACRO, f"{start_year}-01-01", ALPHA_VANTAGE_KEY)
-        res, dates, fcasts, champ, runner, m_table, r_scores, oos_years, diag = run_tournament_engine(raw_data.to_json(), rf, t_cost, start_year, data_src)
-        next_trade_day = get_next_trading_day()
-        st.session_state.results = {
-            "res": res, "dates": dates, "fcasts": fcasts, "champ": champ, "runner": runner, 
-            "rf": rf, "monthly": m_table, "recency": r_scores, "t_cost": t_cost, 
-            "oos_years": oos_years, "next_day": next_trade_day, "diagnostics": diag
-        }
-        status.update(label=f"Tournament Complete!", state="complete")
+        try:
+            rf = get_sofr_rate(FRED_API_KEY)
+            raw_data, data_src = fetch_market_data(TARGET_ETFS + MACRO, f"{start_year}-01-01", ALPHA_VANTAGE_KEY)
+            res, dates, fcasts, champ, runner, m_table, r_scores, oos_years, diag = run_tournament_engine(raw_data.to_json(), rf, t_cost, start_year, data_src)
+            next_trade_day = get_next_trading_day()
+            st.session_state.results = {
+                "res": res, "dates": dates, "fcasts": fcasts, "champ": champ, "runner": runner, 
+                "rf": rf, "monthly": m_table, "recency": r_scores, "t_cost": t_cost, 
+                "oos_years": oos_years, "next_day": next_trade_day, "diagnostics": diag
+            }
+            status.update(label=f"Tournament Complete!", state="complete")
+        except Exception as e:
+            status.update(label=f"Error: {str(e)}", state="error")
+            st.error(f"Failed to run tournament: {str(e)}")
+            st.stop()
     st.rerun()
 
 if st.session_state.results:
@@ -378,10 +396,10 @@ if st.session_state.results:
     fig = go.Figure()
     for name, r in s['res'].items(): fig.add_trace(go.Scatter(x=s['dates'], y=np.cumprod(1 + np.array(r)), name=name))
     fig.update_layout(title="Net Return Performance", template="plotly_dark", height=400)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
     st.subheader(f"📅 Monthly Matrix ({s['champ']})")
-    st.dataframe(s['monthly'].style.format("{:.2%}"), use_container_width=True)
+    st.dataframe(s['monthly'].style.format("{:.2%}"), width='stretch')
 
     st.divider()
     st.header("🔍 Methodology")
@@ -408,21 +426,22 @@ if st.session_state.results:
         st.markdown("**Transformer**")
         st.caption("An attention-based neural network architecture that weighs the importance of different time steps in the input sequence. Uses multi-head self-attention mechanisms to capture complex temporal relationships in market data. Trained for 50 epochs.")
     
-    # Data Diagnostics
-    st.divider()
-    st.subheader("📊 Data Diagnostics")
-    diag = s['diagnostics']
-    
-    if diag['requested_start'] != diag['actual_start']:
-        st.warning(f"⚠️ **Data Availability Notice:** Data requested from {diag['requested_start']}, but actual usable data starts from {diag['actual_start']} due to instrument availability and momentum calculation requirements.")
-    
-    col_a, col_b, col_c = st.columns(3)
-    with col_a:
-        st.metric("Data Source", diag['data_source'])
-        st.metric("Requested Start", diag['requested_start'])
-    with col_b:
-        st.metric("Actual Data Start", diag['actual_start'])
-        st.metric("Training/OOS Split", diag['split_date'])
-    with col_c:
-        st.metric("Total Data Rows", f"{diag['processed_rows']:,}")
-        st.metric("Optimal Lookback", f"{diag['best_lookback']} days")
+    # Data Diagnostics - only show if diagnostics exists (backwards compatibility)
+    if 'diagnostics' in s:
+        st.divider()
+        st.subheader("📊 Data Diagnostics")
+        diag = s['diagnostics']
+        
+        if diag['requested_start'] != diag['actual_start']:
+            st.warning(f"⚠️ **Data Availability Notice:** Data requested from {diag['requested_start']}, but actual usable data starts from {diag['actual_start']} due to instrument availability and momentum calculation requirements.")
+        
+        col_a, col_b, col_c = st.columns(3)
+        with col_a:
+            st.metric("Data Source", diag['data_source'])
+            st.metric("Requested Start", diag['requested_start'])
+        with col_b:
+            st.metric("Actual Data Start", diag['actual_start'])
+            st.metric("Training/OOS Split", diag['split_date'])
+        with col_c:
+            st.metric("Total Data Rows", f"{diag['processed_rows']:,}")
+            st.metric("Optimal Lookback", f"{diag['best_lookback']} days")

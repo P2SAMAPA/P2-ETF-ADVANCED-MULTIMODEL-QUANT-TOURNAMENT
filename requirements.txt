@@ -1,14 +1,12 @@
-# requirements.txt
 streamlit
-yfinance
 pandas
 numpy
 torch
 stable-baselines3
-shimmy
 gymnasium
 scikit-learn
-pytz
-requests
 plotly
+requests
 pandas-market-calendars
+huggingface-hub
+pyarrow

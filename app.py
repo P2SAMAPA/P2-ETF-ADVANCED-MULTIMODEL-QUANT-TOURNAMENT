@@ -12,6 +12,7 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 import requests
 import pandas_market_calendars as mcal
+import time
 
 # --- 1. SETTINGS & STATE ---
 st.set_page_config(page_title="Alpha Tournament Pro", layout="wide")
@@ -21,10 +22,11 @@ if 'results' not in st.session_state: st.session_state.results = None
 TARGET_ETFS = ['TLT', 'TBT', 'VNQ', 'GLD', 'SLV']
 MACRO = ['^VIX', '^TNX', 'DX-Y.NYB']
 FRED_API_KEY = st.secrets.get("FRED_API_KEY")
+ALPHA_VANTAGE_KEY = st.secrets.get("ALPHA_VANTAGE_KEY")
 
 # --- 2. MODEL ARCHITECTURES ---
 class CNN_LSTM_Model(nn.Module):
-    def __init__(self, input_dim, output_dim):
+    def __init__(self, input_dim, output_dim, seq_len):
         super().__init__()
         self.conv = nn.Conv1d(input_dim, 64, kernel_size=3, padding=1)
         self.lstm = nn.LSTM(64, 128, batch_first=True)
@@ -36,7 +38,7 @@ class CNN_LSTM_Model(nn.Module):
         return self.fc(hn[-1])
 
 class TransformerModel(nn.Module):
-    def __init__(self, input_dim, output_dim):
+    def __init__(self, input_dim, output_dim, seq_len):
         super().__init__()
         self.input_proj = nn.Linear(input_dim, 64)
         encoder_layer = nn.TransformerEncoderLayer(d_model=64, nhead=4, batch_first=True)
@@ -66,6 +68,65 @@ def get_next_trading_day():
             return day.strftime('%Y-%m-%d')
     return (today + timedelta(days=1)).strftime('%Y-%m-%d')
 
+def fetch_alpha_vantage_data(tickers, start_date, api_key):
+    """Fetch data from Alpha Vantage as fallback"""
+    if not api_key:
+        return None
+    
+    all_data = {}
+    for ticker in tickers:
+        try:
+            url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY_ADJUSTED&symbol={ticker}&outputsize=full&apikey={api_key}"
+            r = requests.get(url, timeout=15).json()
+            
+            if 'Time Series (Daily)' not in r:
+                continue
+                
+            ts_data = r['Time Series (Daily)']
+            df = pd.DataFrame.from_dict(ts_data, orient='index')
+            df.index = pd.to_datetime(df.index)
+            df = df.sort_index()
+            df = df[df.index >= start_date]
+            all_data[ticker] = df['5. adjusted close'].astype(float)
+            time.sleep(12)  # Alpha Vantage rate limit
+        except:
+            continue
+    
+    if len(all_data) > 0:
+        return pd.DataFrame(all_data)
+    return None
+
+def fetch_market_data(tickers, start_date, av_key):
+    """Fetch data with yfinance primary, Alpha Vantage fallback"""
+    data_source = "yfinance"
+    
+    try:
+        data = yf.download(tickers, start=start_date, progress=False)['Close']
+        if isinstance(data, pd.Series):
+            data = data.to_frame()
+        data = data.ffill().dropna()
+        
+        if len(data) < 100:
+            raise Exception("Insufficient data from yfinance")
+            
+    except Exception as e:
+        data_source = "Alpha Vantage (fallback)"
+        data = fetch_alpha_vantage_data(tickers, start_date, av_key)
+        if data is None or len(data) < 100:
+            raise Exception("Unable to fetch sufficient data from both sources")
+    
+    return data, data_source
+
+def calculate_momentum_features(data, lookback_periods=[30, 45, 60]):
+    """Calculate momentum features for multiple lookback periods"""
+    momentum_features = {}
+    
+    for period in lookback_periods:
+        momentum = data.pct_change(period)
+        momentum_features[f'momentum_{period}d'] = momentum
+    
+    return momentum_features
+
 class TradingEnv(gym.Env):
     def __init__(self, features, returns, etfs, tcost_bps):
         super().__init__()
@@ -92,30 +153,91 @@ class TradingEnv(gym.Env):
 
 # --- 4. ENGINE ---
 @st.cache_resource(ttl=604800)
-def run_tournament_engine(data_json, rf_rate, tcost_bps, start_year):
+def run_tournament_engine(data_json, rf_rate, tcost_bps, start_year, data_source):
     data = pd.read_json(data_json)
-    rets_df = data[TARGET_ETFS].pct_change().dropna()
-    feats_df = data.shift(1).dropna()
+    
+    # Track data transformations for diagnostics
+    raw_start = data.index[0].strftime('%Y-%m-%d')
+    raw_end = data.index[-1].strftime('%Y-%m-%d')
+    raw_rows = len(data)
+    
+    # Calculate momentum features for different lookback periods
+    lookback_periods = [30, 45, 60]
+    momentum_dict = calculate_momentum_features(data, lookback_periods)
+    
+    # Test each lookback period to find best performing one
+    best_lookback = None
+    best_score = -np.inf
+    
+    for period in lookback_periods:
+        momentum_data = momentum_dict[f'momentum_{period}d']
+        combined_data = pd.concat([data, momentum_data.add_suffix(f'_mom{period}')], axis=1).dropna()
+        
+        if len(combined_data) < 100:
+            continue
+            
+        # Quick validation score using simple correlation
+        rets = combined_data[TARGET_ETFS].pct_change().dropna()
+        mom_cols = [col for col in combined_data.columns if f'_mom{period}' in col]
+        if len(rets) > 0 and len(mom_cols) > 0:
+            score = np.abs(combined_data[mom_cols].corrwith(rets[TARGET_ETFS[0]])).mean()
+            if score > best_score:
+                best_score = score
+                best_lookback = period
+    
+    # Use best lookback period or default to 45
+    if best_lookback is None:
+        best_lookback = 45
+    
+    # Build final dataset with best lookback
+    momentum_data = momentum_dict[f'momentum_{best_lookback}d']
+    data_with_momentum = pd.concat([data, momentum_data.add_suffix(f'_mom{best_lookback}')], axis=1).dropna()
+    
+    rets_df = data_with_momentum[TARGET_ETFS].pct_change().dropna()
+    feats_df = data_with_momentum.shift(1).dropna()
     common_idx = rets_df.index.intersection(feats_df.index)
+    
+    # More diagnostics
+    after_processing_start = common_idx[0].strftime('%Y-%m-%d')
+    after_processing_rows = len(common_idx)
+    
     X, y = feats_df.loc[common_idx].values, rets_df.loc[common_idx].values
     
     scaler = StandardScaler()
     X_sc = scaler.fit_transform(X).astype(np.float32)
-    split = int(len(X_sc) * 0.8) 
-    X_train, X_test, y_train, y_test = X_sc[:split], X_sc[split:], y[:split], y[split:]
-
-    # Get actual test period dates
-    test_dates = common_idx[split:]
+    split = int(len(X_sc) * 0.8)
+    split_date = common_idx[split].strftime('%Y-%m-%d')
     
-    env = DummyVecEnv([lambda: TradingEnv(X_train, y_train, TARGET_ETFS, tcost_bps)])
+    # Create sequences for deep learning models
+    seq_len = best_lookback
+    X_seq = []
+    y_seq = []
+    for i in range(seq_len, len(X_sc)):
+        X_seq.append(X_sc[i-seq_len:i])
+        y_seq.append(y[i])
+    X_seq = np.array(X_seq)
+    y_seq = np.array(y_seq)
+    
+    # Adjust split for sequences
+    split_seq = int(len(X_seq) * 0.8)
+    X_train, X_test = X_seq[:split_seq], X_seq[split_seq:]
+    y_train, y_test = y_seq[:split_seq], y_seq[split_seq:]
+    
+    # For RL models, use flattened current features
+    X_train_flat = X_sc[:split]
+    X_test_flat = X_sc[split:]
+    y_train_rl = y[:split]
+    y_test_rl = y[split:]
+    
+    env = DummyVecEnv([lambda: TradingEnv(X_train_flat, y_train_rl, TARGET_ETFS, tcost_bps)])
     ppo = PPO("MlpPolicy", env, verbose=0).learn(5000)
     a2c = A2C("MlpPolicy", env, verbose=0).learn(5000)
     
     dl_models = {}
     for name, m_class in [("CNN-LSTM", CNN_LSTM_Model), ("Transformer", TransformerModel)]:
-        model = m_class(X.shape[1], len(TARGET_ETFS))
+        model = m_class(X.shape[1], len(TARGET_ETFS), seq_len)
         opt = torch.optim.Adam(model.parameters(), lr=0.005)
-        X_t, y_t = torch.tensor(X_train).unsqueeze(1), torch.tensor(y_train).float()
+        X_t, y_t = torch.tensor(X_train).float(), torch.tensor(y_train).float()
         for _ in range(50): 
             opt.zero_grad()
             nn.MSELoss()(model(X_t), y_t).backward()
@@ -123,19 +245,35 @@ def run_tournament_engine(data_json, rf_rate, tcost_bps, start_year):
         dl_models[name] = model
 
     results = {"PPO": [], "A2C": [], "CNN-LSTM": [], "Transformer": []}
+    test_dates = common_idx[split:]
     tcost_dec = tcost_bps / 10000
 
-    for name in results.keys():
+    # PPO and A2C predictions
+    for name in ["PPO", "A2C"]:
+        last_pick = None
+        for i in range(len(X_test_flat)):
+            if name == "PPO": 
+                act, _ = ppo.predict(X_test_flat[i], deterministic=True)
+            else:
+                act, _ = a2c.predict(X_test_flat[i], deterministic=True)
+            
+            day_ret = y_test_rl[i, act]
+            if last_pick is not None and act != last_pick: 
+                day_ret -= tcost_dec
+            results[name].append(day_ret)
+            last_pick = act
+    
+    # Deep learning model predictions
+    for name in ["CNN-LSTM", "Transformer"]:
         last_pick = None
         for i in range(len(X_test)):
-            if name == "PPO": act, _ = ppo.predict(X_test[i], deterministic=True)
-            elif name == "A2C": act, _ = a2c.predict(X_test[i], deterministic=True)
-            else:
-                with torch.no_grad():
-                    out = dl_models[name](torch.tensor(X_test[i]).reshape(1, 1, -1))
-                    act = torch.argmax(out).item()
+            with torch.no_grad():
+                out = dl_models[name](torch.tensor(X_test[i]).unsqueeze(0).float())
+                act = torch.argmax(out).item()
+            
             day_ret = y_test[i, act]
-            if last_pick is not None and act != last_pick: day_ret -= tcost_dec
+            if last_pick is not None and act != last_pick:
+                day_ret -= tcost_dec
             results[name].append(day_ret)
             last_pick = act
 
@@ -155,13 +293,17 @@ def run_tournament_engine(data_json, rf_rate, tcost_bps, start_year):
     
     # Forecasts for both
     forecasts = {}
-    latest_feat = X_sc[-1:]
+    latest_feat_flat = X_sc[-1:]
+    latest_feat_seq = X_seq[-1:]
+    
     for m in [champ, runner_up]:
-        if m == "PPO": act, _ = ppo.predict(latest_feat[0], deterministic=True)
-        elif m == "A2C": act, _ = a2c.predict(latest_feat[0], deterministic=True)
+        if m == "PPO": 
+            act, _ = ppo.predict(latest_feat_flat[0], deterministic=True)
+        elif m == "A2C": 
+            act, _ = a2c.predict(latest_feat_flat[0], deterministic=True)
         else:
             with torch.no_grad():
-                f_out = dl_models[m](torch.tensor(latest_feat).reshape(1, 1, -1))
+                f_out = dl_models[m](torch.tensor(latest_feat_seq).float())
                 act = torch.argmax(f_out).item()
         forecasts[m] = TARGET_ETFS[act]
 
@@ -172,7 +314,20 @@ def run_tournament_engine(data_json, rf_rate, tcost_bps, start_year):
     m_table.columns = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][:len(m_table.columns)]
     m_table['Yearly Total'] = m_table.apply(lambda row: np.prod(1 + row) - 1, axis=1)
 
-    return results, test_dates, forecasts, champ, runner_up, m_table, recency_scores, oos_years
+    # Diagnostics info
+    diagnostics = {
+        'requested_start': f"{start_year}-01-01",
+        'raw_start': raw_start,
+        'raw_end': raw_end,
+        'raw_rows': raw_rows,
+        'actual_start': after_processing_start,
+        'processed_rows': after_processing_rows,
+        'split_date': split_date,
+        'data_source': data_source,
+        'best_lookback': best_lookback
+    }
+
+    return results, test_dates, forecasts, champ, runner_up, m_table, recency_scores, oos_years, diagnostics
 
 # --- 5. UI ---
 st.title("Alpha Tournament Pro: Multi-model ETF Forecast")
@@ -186,10 +341,14 @@ with st.sidebar:
 if run_btn:
     with st.status(f"Training Tournament Models...") as status:
         rf = get_sofr_rate(FRED_API_KEY)
-        raw_data = yf.download(TARGET_ETFS + MACRO, start=f"{start_year}-01-01", progress=False)['Close'].ffill().dropna()
-        res, dates, fcasts, champ, runner, m_table, r_scores, oos_years = run_tournament_engine(raw_data.to_json(), rf, t_cost, start_year)
+        raw_data, data_src = fetch_market_data(TARGET_ETFS + MACRO, f"{start_year}-01-01", ALPHA_VANTAGE_KEY)
+        res, dates, fcasts, champ, runner, m_table, r_scores, oos_years, diag = run_tournament_engine(raw_data.to_json(), rf, t_cost, start_year, data_src)
         next_trade_day = get_next_trading_day()
-        st.session_state.results = {"res": res, "dates": dates, "fcasts": fcasts, "champ": champ, "runner": runner, "rf": rf, "monthly": m_table, "recency": r_scores, "t_cost": t_cost, "oos_years": oos_years, "next_day": next_trade_day}
+        st.session_state.results = {
+            "res": res, "dates": dates, "fcasts": fcasts, "champ": champ, "runner": runner, 
+            "rf": rf, "monthly": m_table, "recency": r_scores, "t_cost": t_cost, 
+            "oos_years": oos_years, "next_day": next_trade_day, "diagnostics": diag
+        }
         status.update(label=f"Tournament Complete!", state="complete")
     st.rerun()
 
@@ -248,3 +407,22 @@ if st.session_state.results:
         
         st.markdown("**Transformer**")
         st.caption("An attention-based neural network architecture that weighs the importance of different time steps in the input sequence. Uses multi-head self-attention mechanisms to capture complex temporal relationships in market data. Trained for 50 epochs.")
+    
+    # Data Diagnostics
+    st.divider()
+    st.subheader("📊 Data Diagnostics")
+    diag = s['diagnostics']
+    
+    if diag['requested_start'] != diag['actual_start']:
+        st.warning(f"⚠️ **Data Availability Notice:** Data requested from {diag['requested_start']}, but actual usable data starts from {diag['actual_start']} due to instrument availability and momentum calculation requirements.")
+    
+    col_a, col_b, col_c = st.columns(3)
+    with col_a:
+        st.metric("Data Source", diag['data_source'])
+        st.metric("Requested Start", diag['requested_start'])
+    with col_b:
+        st.metric("Actual Data Start", diag['actual_start'])
+        st.metric("Training/OOS Split", diag['split_date'])
+    with col_c:
+        st.metric("Total Data Rows", f"{diag['processed_rows']:,}")
+        st.metric("Optimal Lookback", f"{diag['best_lookback']} days")

@@ -1,5 +1,4 @@
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import numpy as np
 import torch
@@ -12,7 +11,8 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 import requests
 import pandas_market_calendars as mcal
-import time
+from huggingface_hub import hf_hub_download, HfApi
+import os
 from io import StringIO
 
 # --- 1. SETTINGS & STATE ---
@@ -22,8 +22,12 @@ if 'results' not in st.session_state: st.session_state.results = None
 
 TARGET_ETFS = ['TLT', 'TBT', 'VNQ', 'GLD', 'SLV']
 MACRO = ['^VIX', '^TNX', 'DX-Y.NYB']
-FRED_API_KEY = st.secrets.get("FRED_API_KEY")
-ALPHA_VANTAGE_KEY = st.secrets.get("ALPHA_VANTAGE_KEY")
+
+# Get secrets from HF Spaces
+FRED_API_KEY = os.environ.get("FRED_API_KEY")
+ALPHA_VANTAGE_KEY = os.environ.get("ALPHA_VANTAGE_KEY")
+HF_TOKEN = os.environ.get("HF_KEY")
+HF_DATASET_REPO = "P2SAMAPA/my-etf-data"
 
 # --- 2. MODEL ARCHITECTURES ---
 class CNN_LSTM_Model(nn.Module):
@@ -72,15 +76,32 @@ def get_next_trading_day():
         pass
     return (pd.Timestamp.now() + timedelta(days=1)).strftime('%Y-%m-%d')
 
+def load_data_from_hf(start_year, hf_token, dataset_repo):
+    """Load data from HuggingFace dataset"""
+    try:
+        # Download the dataset file
+        file_path = hf_hub_download(
+            repo_id=dataset_repo,
+            filename=f"etf_data_{start_year}.parquet",
+            repo_type="dataset",
+            token=hf_token
+        )
+        data = pd.read_parquet(file_path)
+        data.index = pd.to_datetime(data.index)
+        return data, "HuggingFace Dataset"
+    except Exception as e:
+        st.warning(f"Could not load from HF dataset: {str(e)[:100]}")
+        return None, None
+
 def fetch_alpha_vantage_data(tickers, start_date, api_key):
     """Fetch data from Alpha Vantage as fallback"""
     if not api_key:
         return None
     
     all_data = {}
+    import time
     for ticker in tickers:
         try:
-            # Clean ticker for Alpha Vantage
             clean_ticker = ticker.replace('^', '')
             url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY_ADJUSTED&symbol={clean_ticker}&outputsize=full&apikey={api_key}"
             r = requests.get(url, timeout=15).json()
@@ -94,7 +115,7 @@ def fetch_alpha_vantage_data(tickers, start_date, api_key):
             df = df.sort_index()
             df = df[df.index >= start_date]
             all_data[ticker] = df['5. adjusted close'].astype(float)
-            time.sleep(13)  # Alpha Vantage rate limit (5 calls/min)
+            time.sleep(13)
         except:
             continue
     
@@ -102,31 +123,21 @@ def fetch_alpha_vantage_data(tickers, start_date, api_key):
         return pd.DataFrame(all_data)
     return None
 
-def fetch_market_data(tickers, start_date, av_key):
-    """Fetch data with yfinance primary, Alpha Vantage fallback"""
-    data_source = "yfinance"
+def fetch_market_data(start_year, hf_token, av_key, dataset_repo):
+    """Fetch data with HF primary, Alpha Vantage fallback"""
+    # Try HF dataset first
+    data, data_source = load_data_from_hf(start_year, hf_token, dataset_repo)
     
-    try:
-        data = yf.download(tickers, start=start_date, progress=False, auto_adjust=True)
-        if len(tickers) == 1:
-            data = pd.DataFrame({'Close': data['Close']})
-        else:
-            data = data['Close']
-        
-        if isinstance(data, pd.Series):
-            data = data.to_frame()
-        
-        data = data.ffill().dropna()
-        
-        if len(data) < 100:
-            raise Exception("Insufficient data from yfinance")
-            
-    except Exception as e:
-        st.warning(f"yfinance failed, trying Alpha Vantage fallback... ({str(e)[:100]})")
-        data_source = "Alpha Vantage (fallback)"
-        data = fetch_alpha_vantage_data(tickers, start_date, av_key)
-        if data is None or len(data) < 100:
-            raise Exception("Unable to fetch sufficient data from both sources. Please try again later.")
+    if data is not None and len(data) >= 100:
+        return data, data_source
+    
+    # Fallback to Alpha Vantage
+    st.warning("HF dataset not available, trying Alpha Vantage fallback...")
+    data_source = "Alpha Vantage (fallback)"
+    data = fetch_alpha_vantage_data(TARGET_ETFS + MACRO, f"{start_year}-01-01", av_key)
+    
+    if data is None or len(data) < 100:
+        raise Exception("Unable to fetch sufficient data from both HF and Alpha Vantage. Please try again later.")
     
     return data, data_source
 
@@ -320,7 +331,7 @@ def run_tournament_engine(data_json, rf_rate, tcost_bps, start_year, data_source
                 act = torch.argmax(f_out).item()
         forecasts[m] = TARGET_ETFS[act]
 
-    # Process Table (Champion only as requested)
+    # Process Table (Champion only)
     champ_series = pd.Series(results[champ], index=test_dates)
     monthly_rets = champ_series.groupby([champ_series.index.year, champ_series.index.month]).apply(lambda x: np.prod(1+x)-1)
     m_table = monthly_rets.unstack().fillna(0)
@@ -355,7 +366,7 @@ if run_btn:
     with st.status(f"Training Tournament Models...") as status:
         try:
             rf = get_sofr_rate(FRED_API_KEY)
-            raw_data, data_src = fetch_market_data(TARGET_ETFS + MACRO, f"{start_year}-01-01", ALPHA_VANTAGE_KEY)
+            raw_data, data_src = fetch_market_data(start_year, HF_TOKEN, ALPHA_VANTAGE_KEY, HF_DATASET_REPO)
             res, dates, fcasts, champ, runner, m_table, r_scores, oos_years, diag = run_tournament_engine(raw_data.to_json(), rf, t_cost, start_year, data_src)
             next_trade_day = get_next_trading_day()
             st.session_state.results = {
@@ -392,7 +403,7 @@ if st.session_state.results:
     r4.metric("Recency Score (15d)", f"{s['recency'][s['runner']]:.0%}")
 
     st.divider()
-    # Charts and Tables follow for Champion (as original UI)
+    # Charts and Tables
     fig = go.Figure()
     for name, r in s['res'].items(): fig.add_trace(go.Scatter(x=s['dates'], y=np.cumprod(1 + np.array(r)), name=name))
     fig.update_layout(title="Net Return Performance", template="plotly_dark", height=400)
@@ -426,7 +437,7 @@ if st.session_state.results:
         st.markdown("**Transformer**")
         st.caption("An attention-based neural network architecture that weighs the importance of different time steps in the input sequence. Uses multi-head self-attention mechanisms to capture complex temporal relationships in market data. Trained for 50 epochs.")
     
-    # Data Diagnostics - only show if diagnostics exists (backwards compatibility)
+    # Data Diagnostics
     if 'diagnostics' in s:
         st.divider()
         st.subheader("📊 Data Diagnostics")

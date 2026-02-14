@@ -97,17 +97,23 @@ def load_data_from_hf(start_year, hf_token, dataset_repo):
         
         # Select the columns we need: returns and features
         ret_cols = [f'{etf}_Ret' for etf in TARGET_ETFS]
+        
+        # Feature columns: ETF technical indicators + macro signals
         feature_cols = []
         for etf in TARGET_ETFS:
             feature_cols.extend([f'{etf}_MA20', f'{etf}_Vol'])
-        feature_cols.extend(['UNRATE', 'CPI'])
+        
+        # Add macro/market signals
+        macro_cols = ['UNRATE', 'CPI', 'VIX', 'TNX', 'DXY', 'AU_CU_Ratio', 'AU_CU_Trend']
+        feature_cols.extend(macro_cols)
         
         # Check all columns exist
         all_cols = ret_cols + feature_cols
         missing = [c for c in all_cols if c not in df.columns]
         if missing:
-            st.error(f"Missing columns: {missing}")
-            return None, None
+            st.warning(f"Missing columns in dataset: {missing}")
+            # Remove missing columns from feature list
+            feature_cols = [c for c in feature_cols if c in df.columns]
         
         # Create returns dataframe (for targets)
         returns_df = df[ret_cols].copy()
@@ -367,7 +373,8 @@ def run_tournament_engine(features_json, returns_json, rf_rate, tcost_bps, start
         'processed_rows': after_processing_rows,
         'split_date': split_date,
         'data_source': data_source,
-        'best_lookback': best_lookback
+        'best_lookback': best_lookback,
+        'num_features': X.shape[1]
     }
 
     return results, test_dates, forecasts, champ, runner_up, m_table, recency_scores, oos_years, diagnostics
@@ -509,4 +516,4 @@ if st.session_state.results:
             st.metric("Training/OOS Split", diag['split_date'])
         with col_c:
             st.metric("Total Data Rows", f"{diag['processed_rows']:,}")
-            st.metric("Optimal Lookback", f"{diag['best_lookback']} days")
+            st.metric("Features Used", f"{diag.get('num_features', 'N/A')}")

@@ -11,3 +11,4 @@ scikit-learn
 pytz
 requests
 plotly
+pandas-market-calendars

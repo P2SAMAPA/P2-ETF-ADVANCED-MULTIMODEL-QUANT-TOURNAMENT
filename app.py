@@ -104,6 +104,9 @@ def run_tournament_engine(data_json, rf_rate, tcost_bps, start_year):
     split = int(len(X_sc) * 0.8) 
     X_train, X_test, y_train, y_test = X_sc[:split], X_sc[split:], y[:split], y[split:]
 
+    # Get actual test period dates
+    test_dates = common_idx[split:]
+    
     env = DummyVecEnv([lambda: TradingEnv(X_train, y_train, TARGET_ETFS, tcost_bps)])
     ppo = PPO("MlpPolicy", env, verbose=0).learn(5000)
     a2c = A2C("MlpPolicy", env, verbose=0).learn(5000)
@@ -120,7 +123,6 @@ def run_tournament_engine(data_json, rf_rate, tcost_bps, start_year):
         dl_models[name] = model
 
     results = {"PPO": [], "A2C": [], "CNN-LSTM": [], "Transformer": []}
-    dates = common_idx[split:]
     tcost_dec = tcost_bps / 10000
 
     for name in results.keys():
@@ -137,9 +139,9 @@ def run_tournament_engine(data_json, rf_rate, tcost_bps, start_year):
             results[name].append(day_ret)
             last_pick = act
 
-    # OOS period calculation
-    oos_start_year = dates[0].year
-    oos_end_year = dates[-1].year
+    # OOS period calculation using actual test dates
+    oos_start_year = test_dates[0].year
+    oos_end_year = test_dates[-1].year
     oos_years = f"{oos_start_year}-{oos_end_year}" if oos_start_year != oos_end_year else str(oos_start_year)
 
     # Logic for ranking
@@ -164,13 +166,13 @@ def run_tournament_engine(data_json, rf_rate, tcost_bps, start_year):
         forecasts[m] = TARGET_ETFS[act]
 
     # Process Table (Champion only as requested)
-    champ_series = pd.Series(results[champ], index=dates)
+    champ_series = pd.Series(results[champ], index=test_dates)
     monthly_rets = champ_series.groupby([champ_series.index.year, champ_series.index.month]).apply(lambda x: np.prod(1+x)-1)
     m_table = monthly_rets.unstack().fillna(0)
     m_table.columns = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][:len(m_table.columns)]
     m_table['Yearly Total'] = m_table.apply(lambda row: np.prod(1 + row) - 1, axis=1)
 
-    return results, dates, forecasts, champ, runner_up, m_table, recency_scores, oos_years
+    return results, test_dates, forecasts, champ, runner_up, m_table, recency_scores, oos_years
 
 # --- 5. UI ---
 st.title("Alpha Tournament Pro: Multi-model ETF Forecast")

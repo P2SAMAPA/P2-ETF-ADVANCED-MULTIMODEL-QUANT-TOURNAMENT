@@ -22,7 +22,7 @@ st.set_page_config(page_title="Alpha Tournament Pro", layout="wide")
 if 'results' not in st.session_state: st.session_state.results = None
 
 TARGET_ETFS = ['TLT', 'TBT', 'VNQ', 'GLD', 'SLV']
-ENSEMBLE_YEARS = [2008, 2010, 2013, 2015, 2019, 2021]
+DEFAULT_ENSEMBLE_YEARS = [2008, 2010, 2013, 2015, 2019, 2021]
 
 # Get secrets from HF Spaces
 FRED_API_KEY = os.environ.get("FRED_API_KEY")
@@ -299,15 +299,15 @@ def run_tournament_engine(_features_df, _returns_df, rf_rate, tcost_bps, start_y
     
     # Train models (reduced iterations for speed)
     env = DummyVecEnv([lambda: TradingEnv(X_train_flat, y_train_rl, TARGET_ETFS, tcost_bps)])
-    ppo = PPO("MlpPolicy", env, verbose=0).learn(3000)  # Reduced from 5000
-    a2c = A2C("MlpPolicy", env, verbose=0).learn(3000)  # Reduced from 5000
+    ppo = PPO("MlpPolicy", env, verbose=0).learn(3000)
+    a2c = A2C("MlpPolicy", env, verbose=0).learn(3000)
     
     dl_models = {}
     for name, m_class in [("CNN-LSTM", CNN_LSTM_Model), ("Transformer", TransformerModel)]:
         model = m_class(X.shape[1], len(TARGET_ETFS), seq_len)
         opt = torch.optim.Adam(model.parameters(), lr=0.005)
         X_t, y_t = torch.tensor(X_train).float(), torch.tensor(y_train).float()
-        for _ in range(30):  # Reduced from 50
+        for _ in range(30):
             opt.zero_grad()
             nn.MSELoss()(model(X_t), y_t).backward()
             opt.step()
@@ -418,12 +418,44 @@ st.title("Alpha Tournament Pro: Multi-model ETF Forecast")
 with st.sidebar:
     st.header("Tournament Configuration")
     t_cost = st.slider("Transaction Cost (bps)", min_value=0, max_value=100, value=10, step=5)
-    run_btn = st.button("🚀 Execute Ensemble Tournament")
     
     st.divider()
-    st.caption("**Training Periods:**")
-    for year in ENSEMBLE_YEARS:
-        st.caption(f"• {year}")
+    st.subheader("Training Periods")
+    
+    # Option A or B selection
+    period_option = st.radio(
+        "Select Training Period Option:",
+        options=["Option A (Default)", "Option B (Custom)"],
+        help="Option A uses predefined optimal periods. Option B lets you choose your own 6 periods."
+    )
+    
+    if period_option == "Option A (Default)":
+        ensemble_years = DEFAULT_ENSEMBLE_YEARS
+        st.caption("**Default Periods:**")
+        for year in ensemble_years:
+            st.caption(f"• {year}")
+    else:
+        st.caption("**Select 6 Years:**")
+        current_year = datetime.now().year
+        available_years = list(range(2008, current_year))
+        
+        # Create 6 dropdowns for year selection
+        selected_years = []
+        for i in range(6):
+            year = st.selectbox(
+                f"Period {i+1}",
+                options=available_years,
+                index=min(i * 2, len(available_years) - 1),
+                key=f"year_{i}"
+            )
+            selected_years.append(year)
+        
+        ensemble_years = sorted(list(set(selected_years)))  # Remove duplicates and sort
+        
+        if len(ensemble_years) < len(set(selected_years)):
+            st.warning(f"⚠️ Duplicate years selected. Using {len(ensemble_years)} unique periods.")
+    
+    run_btn = st.button("🚀 Execute Ensemble Tournament")
 
 if run_btn:
     with st.status(f"Running Ensemble Tournament...") as status:
@@ -433,8 +465,8 @@ if run_btn:
             ensemble_results = {}
             progress_container = st.empty()
             
-            for idx, start_year in enumerate(ENSEMBLE_YEARS):
-                progress_container.info(f"Training period {start_year}... ({idx+1}/{len(ENSEMBLE_YEARS)})")
+            for idx, start_year in enumerate(ensemble_years):
+                progress_container.info(f"Training period {start_year}... ({idx+1}/{len(ensemble_years)})")
                 
                 data_tuple = load_data_from_hf(start_year, HF_TOKEN, HF_DATASET_REPO)
                 
@@ -489,7 +521,8 @@ if run_btn:
                 "best_result": best_result,
                 "best_period": best_period,
                 "rf": rf,
-                "next_day": next_trade_day
+                "next_day": next_trade_day,
+                "ensemble_years": ensemble_years
             }
             
             status.update(label=f"Ensemble Tournament Complete!", state="complete")
@@ -525,6 +558,9 @@ if st.session_state.results:
     cons3.metric("Model Agreement", 
                 f"{s['agreement_count']}/{s['total_periods']} periods",
                 delta="Champion = Runner-up")
+    
+    # Show which periods were used
+    st.caption(f"**Training Periods Used:** {', '.join(map(str, s['ensemble_years']))}")
     
     # Voting breakdown
     st.divider()
@@ -578,7 +614,7 @@ if st.session_state.results:
     
     The Alpha Tournament uses an ensemble approach to reduce overfitting and increase prediction robustness:
     
-    1. **Multiple Training Periods:** Models are trained on 6 different historical periods (2008, 2010, 2013, 2015, 2019, 2021), each using an 80/20 train/test split up to 2026.
+    1. **Multiple Training Periods:** Models are trained on 6 different historical periods, each using an 80/20 train/test split up to 2026.
     
     2. **Independent Tournaments:** Each training period runs a complete tournament with 4 model architectures (PPO, A2C, CNN-LSTM, Transformer) competing against each other.
     

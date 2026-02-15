@@ -74,6 +74,29 @@ def get_next_trading_day():
         pass
     return (pd.Timestamp.now() + timedelta(days=1)).strftime('%Y-%m-%d')
 
+def analyze_period_characteristics(returns_df, test_start_idx):
+    """Analyze the OOS period to understand if returns are reasonable"""
+    test_returns = returns_df.iloc[test_start_idx:]
+    
+    stats = {}
+    for etf in returns_df.columns:
+        etf_rets = test_returns[etf]
+        stats[etf] = {
+            'mean_daily': etf_rets.mean(),
+            'std_daily': etf_rets.std(),
+            'sharpe': etf_rets.mean() / etf_rets.std() * np.sqrt(252) if etf_rets.std() > 0 else 0,
+            'max_daily': etf_rets.max(),
+            'min_daily': etf_rets.min(),
+            'total_return': (1 + etf_rets).prod() - 1
+        }
+    
+    # Check TLT vs TBT correlation (should be negative)
+    if 'TLT' in returns_df.columns and 'TBT' in returns_df.columns:
+        tlt_tbt_corr = test_returns['TLT'].corr(test_returns['TBT'])
+        stats['tlt_tbt_correlation'] = tlt_tbt_corr
+    
+    return stats
+
 def calculate_hold_period_returns(predictions, returns_df, tcost_bps, hold_periods=[1, 3, 5]):
     """Calculate annualized returns for different hold periods accounting for transaction costs"""
     tcost_dec = tcost_bps / 10000
@@ -298,6 +321,9 @@ def run_tournament_engine(features_json, returns_json, rf_rate, tcost_bps, start
     split = int(len(X_sc) * 0.8)
     split_date = common_idx[split].strftime('%Y-%m-%d')
     
+    # Analyze OOS period characteristics
+    period_stats = analyze_period_characteristics(returns_df.loc[common_idx], split)
+    
     # Create sequences for deep learning models
     seq_len = best_lookback
     X_seq = []
@@ -432,7 +458,8 @@ def run_tournament_engine(features_json, returns_json, rf_rate, tcost_bps, start
         'data_source': data_source,
         'best_lookback': best_lookback,
         'num_features': X.shape[1],
-        'train_test_split': '80/20'
+        'train_test_split': '80/20',
+        'period_stats': period_stats
     }
 
     return results, test_dates, forecasts, champ, runner_up, m_table, recency_scores, oos_years, diagnostics
@@ -553,6 +580,8 @@ if st.session_state.results:
     **Annualized Return:** Calculated using actual trading days: (1 + total_return)^(252/num_days) - 1
     
     **Optimal Hold Period:** Model tests 1-day, 3-day, and 5-day hold periods, calculating annualized returns after transaction costs for each. The period with the highest net annualized return is recommended.
+    
+    **Returns Calculation:** Dataset uses close-to-close daily returns: (Today's Close - Yesterday's Close) / Yesterday's Close
     """)
     
     st.subheader("🤖 Model Descriptions")
@@ -576,8 +605,35 @@ if st.session_state.results:
     # Data Diagnostics
     if 'diagnostics' in s:
         st.divider()
-        st.subheader("📊 Data Diagnostics")
+        st.subheader("📊 Data Diagnostics & Period Analysis")
         diag = s['diagnostics']
+        
+        # Period analysis
+        if 'period_stats' in diag:
+            pstats = diag['period_stats']
+            st.write("**OOS Period Characteristics:**")
+            
+            # TLT/TBT correlation check
+            if 'tlt_tbt_correlation' in pstats:
+                corr_val = pstats['tlt_tbt_correlation']
+                if corr_val < -0.8:
+                    st.success(f"✅ TLT/TBT Correlation: {corr_val:.2f} (Strong negative - ideal for switching strategy)")
+                elif corr_val < -0.5:
+                    st.info(f"ℹ️ TLT/TBT Correlation: {corr_val:.2f} (Moderate negative)")
+                else:
+                    st.warning(f"⚠️ TLT/TBT Correlation: {corr_val:.2f} (Weak relationship - reduces switching advantage)")
+            
+            # Individual ETF stats
+            st.write("**Individual ETF Performance (OOS Period):**")
+            etf_df = pd.DataFrame({
+                etf: {
+                    'Total Return': f"{stats['total_return']:.2%}",
+                    'Sharpe Ratio': f"{stats['sharpe']:.2f}",
+                    'Daily Volatility': f"{stats['std_daily']:.3%}"
+                }
+                for etf, stats in pstats.items() if etf != 'tlt_tbt_correlation'
+            }).T
+            st.dataframe(etf_df)
         
         if diag['requested_start'] != diag['actual_start']:
             st.warning(f"⚠️ **Data Availability Notice:** Data requested from {diag['requested_start']}, but actual usable data starts from {diag['actual_start']} due to momentum calculation requirements.")

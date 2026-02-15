@@ -527,13 +527,7 @@ if st.session_state.results:
     num_trading_days_c = len(c_rets)
     annualized_return_c = (1 + total_return_c) ** (252 / num_trading_days_c) - 1
     
-    # Get optimal hold period and stats
-    optimal_hold_c = s['fcasts'][s['champ']]['optimal_hold']
-    hold_stats_c = s['fcasts'][s['champ']]['hold_periods']
-    
-    c1.metric(f"PREDICTION", 
-              s['fcasts'][s['champ']]['etf'], 
-              delta=f"Hold: {optimal_hold_c}d | Ann. Return: {hold_stats_c[optimal_hold_c]['annualized']:.2%}")
+    c1.metric(f"PREDICTION", s['fcasts'][s['champ']]['etf'], delta=f"Valid: {s['next_day']}")
     c2.metric("Annualized Return (Net)", f"{annualized_return_c:.2%}", delta=f"OOS: {s['oos_years']}")
     c3.metric("Sharpe (Annualized)", f"{((np.mean(c_rets)-(s['rf']/252))/np.std(c_rets)*np.sqrt(252)):.2f}", delta=f"SOFR: {s['rf']:.2%}", delta_color="normal")
     c4.metric("Recency Score (15d)", f"{s['recency'][s['champ']]:.0%}")
@@ -548,13 +542,7 @@ if st.session_state.results:
     num_trading_days_r = len(r_rets)
     annualized_return_r = (1 + total_return_r) ** (252 / num_trading_days_r) - 1
     
-    # Get optimal hold period and stats
-    optimal_hold_r = s['fcasts'][s['runner']]['optimal_hold']
-    hold_stats_r = s['fcasts'][s['runner']]['hold_periods']
-    
-    r1.metric(f"PREDICTION", 
-              s['fcasts'][s['runner']]['etf'], 
-              delta=f"Hold: {optimal_hold_r}d | Ann. Return: {hold_stats_r[optimal_hold_r]['annualized']:.2%}")
+    r1.metric(f"PREDICTION", s['fcasts'][s['runner']]['etf'], delta=f"Valid: {s['next_day']}")
     r2.metric("Annualized Return (Net)", f"{annualized_return_r:.2%}", delta=f"OOS: {s['oos_years']}")
     r3.metric("Sharpe (Annualized)", f"{((np.mean(r_rets)-(s['rf']/252))/np.std(r_rets)*np.sqrt(252)):.2f}", delta=f"SOFR: {s['rf']:.2%}", delta_color="normal")
     r4.metric("Recency Score (15d)", f"{s['recency'][s['runner']]:.0%}")

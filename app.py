@@ -134,51 +134,27 @@ def calculate_hold_period_returns(predictions, returns_df, tcost_bps, hold_perio
     return hold_returns, optimal_period
 
 @st.cache_data(ttl=3600)
+@st.cache_data(ttl=3600)
 def load_data_from_hf(start_year, hf_token, dataset_repo):
-    """Load data from HuggingFace dataset with fallback for raw files."""
+    """Load data from HuggingFace dataset – simplified fallback for CSV."""
     try:
         # First attempt: load as a dataset with 'train' split (in case it's a proper dataset)
         dataset = load_dataset(dataset_repo, split='train', token=hf_token)
         df = dataset.to_pandas()
     except Exception as e:
-        st.warning(f"Standard dataset load failed: {e}. Trying raw file loading...")
+        st.warning(f"Standard dataset load failed: {e}. Trying direct CSV download...")
         try:
-            from huggingface_hub import list_repo_files
-            # List files in the dataset repository (important: repo_type='dataset')
-            files = list_repo_files(repo_id=dataset_repo, repo_type="dataset", token=hf_token)
-            
-            # Filter for supported data file extensions
-            supported_exts = ['.csv', '.parquet', '.json', '.jsonl', '.arrow']
-            data_files = [
-                f'hf://datasets/{dataset_repo}/{f}'
-                for f in files
-                if any(f.lower().endswith(ext) for ext in supported_exts)
-            ]
-            
-            if not data_files:
-                st.error(f"No supported data files found in {dataset_repo}")
-                return None, None
-
-            # Determine builder based on the first data file (assume CSV for simplicity if present)
-            # You can extend this logic for multiple types
-            first_file = data_files[0].lower()
-            if '.csv' in first_file:
-                builder = 'csv'
-            elif '.parquet' in first_file:
-                builder = 'parquet'
-            elif '.json' in first_file or '.jsonl' in first_file:
-                builder = 'json'
-            elif '.arrow' in first_file:
-                builder = 'arrow'
-            else:
-                st.error(f"Unsupported file type in {first_file}")
-                return None, None
-
-            # Load dataset using the determined builder and all found files
-            dataset = load_dataset(builder, data_files=data_files, token=hf_token, split='train')
-            df = dataset.to_pandas()
+            from huggingface_hub import hf_hub_download
+            # Download the CSV file (adjust filename if yours is different)
+            csv_path = hf_hub_download(
+                repo_id=dataset_repo,
+                filename="etf_data.csv",
+                repo_type="dataset",
+                token=hf_token
+            )
+            df = pd.read_csv(csv_path)
         except Exception as e2:
-            st.error(f"Fallback loading also failed: {e2}")
+            st.error(f"Direct CSV download also failed: {e2}")
             import traceback
             st.code(traceback.format_exc())
             return None, None

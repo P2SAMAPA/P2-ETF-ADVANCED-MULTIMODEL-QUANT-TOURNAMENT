@@ -15,6 +15,7 @@ from datasets import load_dataset
 import os
 from io import StringIO
 from collections import Counter
+from huggingface_hub import list_repo_files   # <--- ADDED IMPORT
 
 # --- 1. SETTINGS & STATE ---
 st.set_page_config(page_title="Alpha Tournament Pro", layout="wide")
@@ -134,90 +135,127 @@ def calculate_hold_period_returns(predictions, returns_df, tcost_bps, hold_perio
 
 @st.cache_data(ttl=3600)
 def load_data_from_hf(start_year, hf_token, dataset_repo):
-    """Load data from HuggingFace dataset"""
+    """Load data from HuggingFace dataset with fallback for raw files."""
     try:
+        # First attempt: load as a dataset with 'train' split
         dataset = load_dataset(dataset_repo, split='train', token=hf_token)
         df = dataset.to_pandas()
-        
-        if 'Date' in df.columns:
-            df['Date'] = pd.to_datetime(df['Date'])
-            df = df.set_index('Date')
-        elif 'date' in df.columns:
-            df['date'] = pd.to_datetime(df['date'])
-            df = df.set_index('date')
-        
-        df = df[df.index >= f'{start_year}-01-01']
-        df = df.sort_index()
-        
-        # Debug: Show available columns
-        # st.write(f"Available columns: {list(df.columns)}")
-        
-        # Check for return columns - try different naming conventions
-        ret_cols = []
-        for etf in TARGET_ETFS:
-            possible_names = [f'{etf}_Ret', f'{etf}_ret', f'{etf}_return', f'{etf}_Return', f'{etf}', f'ret_{etf}']
-            for name in possible_names:
-                if name in df.columns:
-                    ret_cols.append(name)
-                    break
-        
-        if len(ret_cols) != len(TARGET_ETFS):
-            missing = [etf for etf in TARGET_ETFS if not any(f'{etf}' in col for col in ret_cols)]
-            st.error(f"Missing return columns for: {missing}")
-            return None, None
-        
-        # Build feature columns - be flexible with naming
-        feature_cols = []
-        for etf in TARGET_ETFS:
-            # Try to find price-related columns for momentum calculation
-            possible_price = [f'{etf}_Close', f'{etf}_close', f'{etf}_price', f'{etf}_Price', f'{etf}']
-            price_col = None
-            for name in possible_price:
-                if name in df.columns:
-                    price_col = name
-                    break
-            
-            # Add technical indicators if they exist
-            for suffix in ['_MA20', '_Vol', '_vol', '_volume', '_Volume', '_MA10', '_MA50', '_RSI']:
-                col_name = f'{etf}{suffix}'
-                if col_name in df.columns:
-                    feature_cols.append(col_name)
-        
-        # Add macro columns
-        macro_cols = ['UNRATE', 'CPI', 'VIX', 'TNX', 'DXY', 'AU_CU_Ratio', 'AU_CU_Trend',
-                      'unrate', 'cpi', 'vix', 'tnx', 'dxy', 'au_cu_ratio']
-        feature_cols.extend([col for col in macro_cols if col in df.columns])
-        
-        # If no feature columns found, use all numeric columns except returns
-        if len(feature_cols) == 0:
-            numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-            feature_cols = [c for c in numeric_cols if c not in ret_cols]
-            st.warning(f"Using {len(feature_cols)} numeric columns as features")
-        
-        returns_df = df[ret_cols].copy()
-        returns_df.columns = TARGET_ETFS
-        
-        features_df = df[feature_cols].copy()
-        
-        # Clean data
-        returns_df = returns_df.replace([np.inf, -np.inf], np.nan).ffill().bfill().dropna()
-        features_df = features_df.replace([np.inf, -np.inf], np.nan).ffill().bfill().dropna()
-        
-        common_idx = returns_df.index.intersection(features_df.index)
-        returns_df = returns_df.loc[common_idx]
-        features_df = features_df.loc[common_idx]
-        
-        if len(returns_df) < 100:
-            st.error(f"Insufficient data: {len(returns_df)} rows")
-            return None, None
-        
-        return (features_df, returns_df), "HuggingFace Dataset"
-        
     except Exception as e:
-        st.error(f"Error loading data: {str(e)}")
-        import traceback
-        st.code(traceback.format_exc())
+        st.warning(f"Standard dataset load failed: {e}. Trying raw file loading...")
+        try:
+            # List all files in the repository
+            files = list_repo_files(repo_id=dataset_repo, token=hf_token)
+            supported_exts = ['.csv', '.parquet', '.json', '.jsonl', '.arrow']
+            # Build list of hf:// URLs for supported files
+            data_files = [
+                f'hf://datasets/{dataset_repo}/{f}'
+                for f in files
+                if any(f.endswith(ext) for ext in supported_exts)
+            ]
+            if not data_files:
+                st.error(f"No supported data files found in {dataset_repo}")
+                return None, None
+
+            # Determine builder from first file extension
+            first_file = files[0]
+            if first_file.endswith('.csv'):
+                builder = 'csv'
+            elif first_file.endswith('.parquet'):
+                builder = 'parquet'
+            elif first_file.endswith('.json') or first_file.endswith('.jsonl'):
+                builder = 'json'
+            elif first_file.endswith('.arrow'):
+                builder = 'arrow'
+            else:
+                st.error(f"Unsupported file type: {first_file}")
+                return None, None
+
+            # Load dataset using the determined builder and all found files
+            dataset = load_dataset(builder, data_files=data_files, token=hf_token, split='train')
+            df = dataset.to_pandas()
+        except Exception as e2:
+            st.error(f"Fallback loading also failed: {e2}")
+            import traceback
+            st.code(traceback.format_exc())
+            return None, None
+
+    # Handle date column
+    if 'Date' in df.columns:
+        df['Date'] = pd.to_datetime(df['Date'])
+        df = df.set_index('Date')
+    elif 'date' in df.columns:
+        df['date'] = pd.to_datetime(df['date'])
+        df = df.set_index('date')
+    else:
+        # If no date column, try to parse index as date or create a default
+        if not isinstance(df.index, pd.DatetimeIndex):
+            st.error("No date column found in dataset.")
+            return None, None
+
+    # Filter by start year
+    df = df[df.index >= f'{start_year}-01-01']
+    df = df.sort_index()
+
+    # Check for return columns - try different naming conventions
+    ret_cols = []
+    for etf in TARGET_ETFS:
+        possible_names = [f'{etf}_Ret', f'{etf}_ret', f'{etf}_return', f'{etf}_Return', f'{etf}', f'ret_{etf}']
+        for name in possible_names:
+            if name in df.columns:
+                ret_cols.append(name)
+                break
+
+    if len(ret_cols) != len(TARGET_ETFS):
+        missing = [etf for etf in TARGET_ETFS if not any(f'{etf}' in col for col in ret_cols)]
+        st.error(f"Missing return columns for: {missing}")
         return None, None
+
+    # Build feature columns - be flexible with naming
+    feature_cols = []
+    for etf in TARGET_ETFS:
+        # Try to find price-related columns for momentum calculation
+        possible_price = [f'{etf}_Close', f'{etf}_close', f'{etf}_price', f'{etf}_Price', f'{etf}']
+        price_col = None
+        for name in possible_price:
+            if name in df.columns:
+                price_col = name
+                break
+
+        # Add technical indicators if they exist
+        for suffix in ['_MA20', '_Vol', '_vol', '_volume', '_Volume', '_MA10', '_MA50', '_RSI']:
+            col_name = f'{etf}{suffix}'
+            if col_name in df.columns:
+                feature_cols.append(col_name)
+
+    # Add macro columns
+    macro_cols = ['UNRATE', 'CPI', 'VIX', 'TNX', 'DXY', 'AU_CU_Ratio', 'AU_CU_Trend',
+                  'unrate', 'cpi', 'vix', 'tnx', 'dxy', 'au_cu_ratio']
+    feature_cols.extend([col for col in macro_cols if col in df.columns])
+
+    # If no feature columns found, use all numeric columns except returns
+    if len(feature_cols) == 0:
+        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        feature_cols = [c for c in numeric_cols if c not in ret_cols]
+        st.warning(f"Using {len(feature_cols)} numeric columns as features")
+
+    returns_df = df[ret_cols].copy()
+    returns_df.columns = TARGET_ETFS
+
+    features_df = df[feature_cols].copy()
+
+    # Clean data
+    returns_df = returns_df.replace([np.inf, -np.inf], np.nan).ffill().bfill().dropna()
+    features_df = features_df.replace([np.inf, -np.inf], np.nan).ffill().bfill().dropna()
+
+    common_idx = returns_df.index.intersection(features_df.index)
+    returns_df = returns_df.loc[common_idx]
+    features_df = features_df.loc[common_idx]
+
+    if len(returns_df) < 100:
+        st.error(f"Insufficient data: {len(returns_df)} rows")
+        return None, None
+
+    return (features_df, returns_df), "HuggingFace Dataset"
 
 class TradingEnv(gym.Env):
     def __init__(self, features, returns, etfs, tcost_bps):

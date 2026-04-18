@@ -24,7 +24,7 @@ if 'results_fi' not in st.session_state: st.session_state.results_fi = None
 if 'results_eq' not in st.session_state: st.session_state.results_eq = None
 
 TARGET_ETFS = ['TLT', 'LQD', 'HYG', 'VCIT', 'VNQ', 'GLD', 'SLV']
-EQ_ETFS = ['XME', 'XLF', 'XLV', 'QQQ', 'XLP', 'XLI', 'XLK', 'XLU', 'XLY', 'GDX', 'XLE']
+EQ_ETFS = ['XME', 'XLF', 'XLV', 'QQQ', 'XLP', 'XLI', 'XLK', 'XLU', 'XLY', 'GDX', 'IWM', 'IWF', 'XSD', 'XBI', 'XLE']
 DEFAULT_ENSEMBLE_YEARS = [2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021,2022, 2023,2024, 2025]
 
 # Get secrets from HF Spaces
